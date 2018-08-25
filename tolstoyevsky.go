@@ -23,15 +23,12 @@ var args struct {
     PrettyLog bool
 }
 
-var storyMapPrefix string
-
 const initialId = "$"
 
 var logger zerolog.Logger
 
 func main() {
     parseArgs()
-    storyMapPrefix = args.KeyPrefix + "story:"
     initLogger()
 
     logger.Info().
@@ -75,6 +72,11 @@ type StoryError struct {
     Story string
     Code uint16
     Err *error
+}
+
+type Redis struct {
+    Conn redis.Conn
+    KeyPrefix string
 }
 
 type Anchor struct {
@@ -124,7 +126,7 @@ func readStory(story string, ctx *fasthttp.RequestCtx) {
 }
 
 func readStoryConn(story string, ctx *fasthttp.RequestCtx, redisConn *redis.Conn) {
-    stream, err := redis.String((*redisConn).Do("LINDEX", storyMapPrefix + story, 0))
+    stream, err := redis.String((*redisConn).Do("LINDEX", args.KeyPrefix + "story:" + story, 0))
     if err == nil {
         ctx.SetBodyStreamWriter(newWriter(stream, ctx.ConnID(), redisConn, initialId))
     } else {
@@ -194,4 +196,17 @@ func parseAnchor(anchor string) Anchor {
     firstId := trimmed[:strings.Index(trimmed, ";")]
     lastId := trimmed[len(firstId) + 1:]
     return Anchor{Stream: stream, FirstId: firstId, LastId: lastId}
+}
+
+func (redis Redis) loadAnchors(story string) ([]Anchor, error) {
+    result, err := redis.Conn.Do("LRANGE", redis.KeyPrefix + "story:" + story, 0, -1)
+    if err == nil {
+        anchors := make([]Anchor, len(result.([]string)))
+        for i, a := range result.([]string) {
+            anchors[i] = parseAnchor(a)
+        }
+        return anchors, nil
+    } else {
+        return nil, err
+    }
 }
