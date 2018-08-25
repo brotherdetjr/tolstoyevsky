@@ -25,7 +25,7 @@ var args struct {
 
 var storyMapPrefix string
 
-var initialId = "$"
+const initialId = "$"
 
 var logger zerolog.Logger
 
@@ -71,10 +71,16 @@ func redisConnection() (redis.Conn, error) {
 }
 
 type StoryError struct {
-    msg string
-    story string
-    code uint16
-    err *error
+    Msg string
+    Story string
+    Code uint16
+    Err *error
+}
+
+type Anchor struct {
+    Stream string
+    FirstId string
+    LastId string
 }
 
 var redisConnErr = "Failed to create connection to Redis"
@@ -83,15 +89,15 @@ var redisStreamNameErr = "Failed to retrieve stream name from Redis"
 func (e StoryError) output(ctx *fasthttp.RequestCtx) {
     errId := uuid.Must(uuid.NewV4()).String()
     logger.Error().
-        Err(*e.err).
-        Str("story", e.story).
+        Err(*e.Err).
+        Str("story", e.Story).
         Uint64("connId", ctx.ConnID()).
         Str("errId", errId).
-        Uint16("code", e.code).
-        Msg(e.msg)
+        Uint16("code", e.Code).
+        Msg(e.Msg)
     ctx.Error(
         fmt.Sprintf(`{"type":"error","code":%d,"msg":%q,"cause":%q,"id":%q}`,
-            e.code, e.msg, e.err, errId),
+            e.Code, e.Msg, e.Err, errId),
         500,
     )
 }
@@ -113,7 +119,7 @@ func readStory(story string, ctx *fasthttp.RequestCtx) {
     if redisConn, err := redisConnection(); err == nil {
         readStoryConn(story, ctx, &redisConn)
     } else {
-        StoryError{msg: redisConnErr, story: story, code: 1, err: &err}.output(ctx)
+        StoryError{Msg: redisConnErr, Story: story, Code: 1, Err: &err}.output(ctx)
     }
 }
 
@@ -122,7 +128,7 @@ func readStoryConn(story string, ctx *fasthttp.RequestCtx, redisConn *redis.Conn
     if err == nil {
         ctx.SetBodyStreamWriter(newWriter(stream, ctx.ConnID(), redisConn, initialId))
     } else {
-        StoryError{msg: redisStreamNameErr, story: story, code: 2, err: &err}.output(ctx)
+        StoryError{Msg: redisStreamNameErr, Story: story, Code: 2, Err: &err}.output(ctx)
     }
 }
 
@@ -182,10 +188,10 @@ func newWriter(stream string, connId uint64, redisConn *redis.Conn, initialId st
     }
 }
 
-func parseAnchor(anchor string) (string, string, string) {
+func parseAnchor(anchor string) Anchor {
     stream := anchor[:strings.Index(anchor, ";")]
     trimmed := anchor[len(stream) + 1:]
     firstId := trimmed[:strings.Index(trimmed, ";")]
     lastId := trimmed[len(firstId) + 1:]
-    return stream, firstId, lastId
+    return Anchor{Stream: stream, FirstId: firstId, LastId: lastId}
 }

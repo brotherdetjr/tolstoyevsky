@@ -6,42 +6,42 @@ import (
 
 func TestParseAnchor(t *testing.T) {
     t.Parallel()
-    stream, firstId, lastId := parseAnchor("prefix:mystream;12345-1;67890-2")
-    if stream != "prefix:mystream" {
-        t.Errorf(`%q != "prefix:mystream"`, stream)
+    anchor := parseAnchor("prefix:mystream;12345-1;67890-2")
+    if anchor.Stream != "prefix:mystream" {
+        t.Errorf(`%q != "prefix:mystream"`, anchor.Stream)
     }
-    if firstId != "12345-1" {
-        t.Errorf(`%q != "12345-1"`, firstId)
+    if anchor.FirstId != "12345-1" {
+        t.Errorf(`%q != "12345-1"`, anchor.FirstId)
     }
-    if lastId != "67890-2" {
-        t.Errorf(`%q != "67890-2"`, lastId)
+    if anchor.LastId != "67890-2" {
+        t.Errorf(`%q != "67890-2"`, anchor.LastId)
     }
 }
 
 func TestParseAnchorNoLastId(t *testing.T) {
     t.Parallel()
-    stream, firstId, lastId := parseAnchor("prefix:mystream;12345-1;")
-    if stream != "prefix:mystream" {
-        t.Errorf(`%q != "prefix:mystream"`, stream)
+    anchor := parseAnchor("prefix:mystream;12345-1;")
+    if anchor.Stream != "prefix:mystream" {
+        t.Errorf(`%q != "prefix:mystream"`, anchor.Stream)
     }
-    if firstId != "12345-1" {
-        t.Errorf(`%q != "12345-1"`, firstId)
+    if anchor.FirstId != "12345-1" {
+        t.Errorf(`%q != "12345-1"`, anchor.FirstId)
     }
-    if lastId != "" {
-        t.Errorf(`%q != ""`, lastId)
+    if anchor.LastId != "" {
+        t.Errorf(`%q != ""`, anchor.LastId)
     }
 }
 
 func TestParseCornerCase(t *testing.T) {
     t.Parallel()
-    stream, firstId, lastId := parseAnchor("a;b;c")
-    if stream != "a" {
-        t.Errorf(`%q != "a"`, stream)
+    anchor := parseAnchor("a;b;c")
+    if anchor.Stream != "a" {
+        t.Errorf(`%q != "a"`, anchor.Stream)
     }
-    if firstId != "b" {
-        t.Errorf(`%q != "b"`, firstId)
+    if anchor.FirstId != "b" {
+        t.Errorf(`%q != "b"`, anchor.FirstId)
     }
-    if lastId != "c" {
-        t.Errorf(`%q != "c"`, lastId)
+    if anchor.LastId != "c" {
+        t.Errorf(`%q != "c"`, anchor.LastId)
     }
 }
