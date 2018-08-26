@@ -77,6 +77,7 @@ type StoryError struct {
 type Redis struct {
     Conn redis.Conn
     KeyPrefix string
+    BatchSize uint16
 }
 
 type Anchor struct {
@@ -209,4 +210,8 @@ func (redis Redis) loadAnchors(story string) ([]Anchor, error) {
     } else {
         return nil, err
     }
+}
+
+func (redis Redis) pump(anchors []Anchor, writer *bufio.Writer) {
+    // TODO
 }
