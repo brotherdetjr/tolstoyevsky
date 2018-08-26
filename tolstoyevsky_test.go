@@ -188,6 +188,53 @@ func TestIsLastBatch(t *testing.T) {
 
 }
 
+func TestLastIdInBatch(t *testing.T) {
+    t.Parallel()
+
+    // given
+    batch := []interface {}{
+        []interface {}{
+            "12345-1",
+            []interface {}{
+                "payload",
+                `{"value": 123}`,
+            },
+        },
+        []interface {}{
+            "67890-0",
+            []interface {}{
+                "payload",
+                `{"value": 124}`,
+            },
+        },
+    }
+
+    // expect
+    if lastIdInBatch(batch) != "67890-0" {
+        t.Fail()
+    }
+}
+
+func TestLastIdInBatchSingleEntry(t *testing.T) {
+    t.Parallel()
+
+    // given
+    batch := []interface {}{
+        []interface {}{
+            "67890-0",
+            []interface {}{
+                "payload",
+                `{"value": 124}`,
+            },
+        },
+    }
+
+    // expect
+    if lastIdInBatch(batch) != "67890-0" {
+        t.Fail()
+    }
+}
+
 func TestReadStory(t *testing.T) {
     t.Parallel()
 
@@ -195,9 +242,9 @@ func TestReadStory(t *testing.T) {
     conn := redigomock.NewConn()
     redis := Redis{Conn: conn, KeyPrefix: "p:", BatchSize: 2}
     anchors := []Anchor{
-        Anchor{Stream: "p:stream1", FirstId: "0", LastId: "67890-2"},
+        Anchor{Stream: "p:stream1", FirstId: "0", LastId: "67890-1"},
         Anchor{Stream: "p:stream2", FirstId: "78900-0", LastId: "78901-0"},
-        Anchor{Stream: "p:stream3", FirstId: "0", LastId: ""},
+        Anchor{Stream: "p:stream3", FirstId: "0", LastId: "89012-3"},
     }
     buf := new(bytes.Buffer)
     expected :=
@@ -211,7 +258,7 @@ func TestReadStory(t *testing.T) {
         `{"type":"event","id":"p:stream3-89012-3","payload":{"value": 130}}`
 
     // interactions
-    conn.Command("XREAD", "BLOCK", 0, "COUNT", 2, "STREAMS", "p:stream1", "0").
+    conn.Command("XREAD", "COUNT", uint32(2), "BLOCK", 0, "STREAMS", "p:stream1", "0").
         Expect([]interface {}{
             []interface {}{
                 "p:stream1",
@@ -233,7 +280,7 @@ func TestReadStory(t *testing.T) {
                 },
             },
         })
-    conn.Command("XREAD", "BLOCK", 0, "COUNT", 2, "STREAMS", "p:stream1", "67890-0").
+    conn.Command("XREAD", "COUNT", uint32(2), "BLOCK", 0, "STREAMS", "p:stream1", "67890-0").
         Expect([]interface {}{
             []interface {}{
                 "p:stream1",
@@ -248,7 +295,7 @@ func TestReadStory(t *testing.T) {
                 },
             },
         })
-    conn.Command("XREAD", "BLOCK", 0, "COUNT", 2, "STREAMS", "p:stream2", "78900-0").
+    conn.Command("XREAD", "COUNT", uint32(2), "BLOCK", 0, "STREAMS", "p:stream2", "78900-0").
         Expect([]interface {}{
             []interface {}{
                 "p:stream2",
@@ -263,7 +310,7 @@ func TestReadStory(t *testing.T) {
                 },
             },
         })
-    conn.Command("XREAD", "BLOCK", 0, "COUNT", 2, "STREAMS", "p:stream3", "0").
+    conn.Command("XREAD", "COUNT", uint32(2), "BLOCK", 0, "STREAMS", "p:stream3", "0").
         Expect([]interface {}{
             []interface {}{
                 "p:stream3",
@@ -285,7 +332,7 @@ func TestReadStory(t *testing.T) {
                 },
             },
         })
-    conn.Command("XREAD", "BLOCK", 0, "COUNT", 2, "STREAMS", "p:stream3", "89012-1").
+    conn.Command("XREAD", "COUNT", uint32(2), "BLOCK", 0, "STREAMS", "p:stream3", "89012-1").
         Expect([]interface {}{
             []interface {}{
                 "p:stream3",

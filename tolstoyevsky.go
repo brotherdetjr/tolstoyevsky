@@ -77,7 +77,7 @@ type StoryError struct {
 type Redis struct {
     Conn redis.Conn
     KeyPrefix string
-    BatchSize uint16
+    BatchSize uint32
 }
 
 type Anchor struct {
@@ -212,12 +212,12 @@ func (redis Redis) loadAnchors(story string) ([]Anchor, error) {
     }
 }
 
-func toEntries(batch interface {}) []interface {} {
-    return batch.([]interface {})[0].([]interface {})[1].([]interface {})
+func toEntries(result interface {}) []interface {} {
+    return result.([]interface {})[0].([]interface {})[1].([]interface {})
 }
 
-func isLastBatch(entries []interface {}, lastId string) bool {
-    for _, entry := range entries {
+func isLastBatch(batch []interface {}, lastId string) bool {
+    for _, entry := range batch {
         if entry.([]interface {})[0] == lastId {
             return true
         }
@@ -225,27 +225,52 @@ func isLastBatch(entries []interface {}, lastId string) bool {
     return false
 }
 
-func (redis Redis) pump(anchors []Anchor, writer *bufio.Writer) {
-/*    for _, anchor := range anchors {
-        for {
-            batch, err := redis.Conn.Do(
-                "XREAD",
-                "COUNT",
-                redis.BatchSize,
-                "BLOCK",
-                0,
-                anchor.Stream,
-                anchor.FirstId,
-            )
-            if err == nil {
-                entries := batch.([]interface {})[0].([]interface {})[1].([]interface {})
-                for _, entry := range entries {
+func lastIdInBatch(batch []interface {}) string {
+    return batch[len(batch) - 1].([]interface {})[0].(string)
+}
 
+func toWriter(writer *bufio.Writer, stream string, id string, payload string) {
+    writer.WriteString(`{"type":"event","id":"`)
+    writer.WriteString(stream)
+    writer.WriteString("-")
+    writer.WriteString(id)
+    writer.WriteString(`","payload":`)
+    writer.WriteString(payload)
+    writer.WriteString("}")
+}
+
+func (redis Redis) pump(anchors []Anchor, writer *bufio.Writer) {
+    for _, anchor := range anchors {
+        firstId := anchor.FirstId
+        for {
+            xReadArgs := []interface {}{
+                "COUNT", redis.BatchSize, "BLOCK", 0, "STREAMS", anchor.Stream, firstId,
+            }
+            batch, err := redis.Conn.Do("XREAD", xReadArgs...)
+            if batch == nil {
+                // this guard is useful in test with incorrectly mocked redis
+                // TODO logging and writer output
+            } else if err == nil {
+                entries := toEntries(batch)
+                for _, entry := range entries {
+                    e := entry.([]interface {})
+                    toWriter(
+                        writer,
+                        anchor.Stream,
+                        e[0].(string),
+                        e[1].([]interface {})[1].(string),
+                    )
+                    writer.Flush() // TODO
+                }
+                if isLastBatch(entries, anchor.LastId) {
+                    break
+                } else {
+                    firstId = lastIdInBatch(entries)
                 }
             } else {
                 // TODO
+                return
             }
         }
-
     }
-*/}
+}
