@@ -123,6 +123,71 @@ func TestLoadAnchorsError(t *testing.T) {
     }
 }
 
+func TestToEntries(t *testing.T) {
+    t.Parallel()
+
+    // given
+    entries := []interface {}{
+        []interface {}{
+            "12345-1",
+            []interface {}{
+                "payload",
+                `{"value": 123}`,
+            },
+        },
+        []interface {}{
+            "67890-0",
+            []interface {}{
+                "payload",
+                `{"value": 124}`,
+            },
+        },
+    }
+    batch := []interface {}{[]interface {}{"p:stream1", entries}}
+
+    // expect
+    if !cmp.Equal(toEntries(batch), entries) {
+        t.Fail()
+    }
+}
+
+func TestIsLastBatch(t *testing.T) {
+    t.Parallel()
+
+    // given
+    batch := []interface {}{
+        []interface {}{
+            "12345-1",
+            []interface {}{
+                "payload",
+                `{"value": 123}`,
+            },
+        },
+        []interface {}{
+            "67890-0",
+            []interface {}{
+                "payload",
+                `{"value": 124}`,
+            },
+        },
+    }
+
+    // expect
+    if !isLastBatch(batch, "12345-1") {
+        t.Error("LastId = 12345-1: should be the last batch!")
+    }
+    if !isLastBatch(batch, "67890-0") {
+        t.Error("LastId = 67890-0: should be the last batch!")
+    }
+    if isLastBatch(batch, "123") {
+        t.Error("LastId = 123: should not be the last batch!")
+    }
+    if isLastBatch(batch, "") {
+        t.Error("LastId = \"\": should not be the last batch!")
+    }
+
+}
+
 func TestReadStory(t *testing.T) {
     t.Parallel()
 
@@ -151,17 +216,19 @@ func TestReadStory(t *testing.T) {
             []interface {}{
                 "p:stream1",
                 []interface {}{
-                    "12345-1",
                     []interface {}{
-                        "payload",
-                        `{"value": 123}`,
+                        "12345-1",
+                        []interface {}{
+                            "payload",
+                            `{"value": 123}`,
+                        },
                     },
-                },
-                []interface {}{
-                    "67890-0",
                     []interface {}{
-                        "payload",
-                        `{"value": 124}`,
+                        "67890-0",
+                        []interface {}{
+                            "payload",
+                            `{"value": 124}`,
+                        },
                     },
                 },
             },
@@ -171,10 +238,12 @@ func TestReadStory(t *testing.T) {
             []interface {}{
                 "p:stream1",
                 []interface {}{
-                    "67890-1",
                     []interface {}{
-                        "payload",
-                        `{"value": 125}`,
+                        "67890-1",
+                        []interface {}{
+                            "payload",
+                            `{"value": 125}`,
+                        },
                     },
                 },
             },
@@ -184,10 +253,12 @@ func TestReadStory(t *testing.T) {
             []interface {}{
                 "p:stream2",
                 []interface {}{
-                    "78901-0",
                     []interface {}{
-                        "payload",
-                        `{"value": 126}`,
+                        "78901-0",
+                        []interface {}{
+                            "payload",
+                            `{"value": 126}`,
+                        },
                     },
                 },
             },
@@ -197,17 +268,19 @@ func TestReadStory(t *testing.T) {
             []interface {}{
                 "p:stream3",
                 []interface {}{
-                    "89012-0",
                     []interface {}{
-                        "payload",
-                        `{"value": 127}`,
+                        "89012-0",
+                        []interface {}{
+                            "payload",
+                            `{"value": 127}`,
+                        },
                     },
-                },
-                []interface {}{
-                    "89012-1",
                     []interface {}{
-                        "payload",
-                        `{"value": 128}`,
+                        "89012-1",
+                        []interface {}{
+                            "payload",
+                            `{"value": 128}`,
+                        },
                     },
                 },
             },
@@ -217,17 +290,19 @@ func TestReadStory(t *testing.T) {
             []interface {}{
                 "p:stream3",
                 []interface {}{
-                    "89012-2",
                     []interface {}{
-                        "payload",
-                        `{"value": 129}`,
+                        "89012-2",
+                        []interface {}{
+                            "payload",
+                            `{"value": 129}`,
+                        },
                     },
-                },
-                []interface {}{
-                    "89012-3",
                     []interface {}{
-                        "payload",
-                        `{"value": 130}`,
+                        "89012-3",
+                        []interface {}{
+                            "payload",
+                            `{"value": 130}`,
+                        },
                     },
                 },
             },

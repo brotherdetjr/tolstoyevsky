@@ -212,6 +212,40 @@ func (redis Redis) loadAnchors(story string) ([]Anchor, error) {
     }
 }
 
-func (redis Redis) pump(anchors []Anchor, writer *bufio.Writer) {
-    // TODO
+func toEntries(batch interface {}) []interface {} {
+    return batch.([]interface {})[0].([]interface {})[1].([]interface {})
 }
+
+func isLastBatch(entries []interface {}, lastId string) bool {
+    for _, entry := range entries {
+        if entry.([]interface {})[0] == lastId {
+            return true
+        }
+    }
+    return false
+}
+
+func (redis Redis) pump(anchors []Anchor, writer *bufio.Writer) {
+/*    for _, anchor := range anchors {
+        for {
+            batch, err := redis.Conn.Do(
+                "XREAD",
+                "COUNT",
+                redis.BatchSize,
+                "BLOCK",
+                0,
+                anchor.Stream,
+                anchor.FirstId,
+            )
+            if err == nil {
+                entries := batch.([]interface {})[0].([]interface {})[1].([]interface {})
+                for _, entry := range entries {
+
+                }
+            } else {
+                // TODO
+            }
+        }
+
+    }
+*/}
