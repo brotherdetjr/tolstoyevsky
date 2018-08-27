@@ -22,6 +22,7 @@ var args struct {
 	ReadTimeout time.Duration
 	KeyPrefix   string
 	PrettyLog   bool
+	XReadCount  uint
 	// TODO OutputBufSize int
 }
 
@@ -39,6 +40,7 @@ func main() {
 		Dur("readTimeout", args.ReadTimeout).
 		Str("keyPrefix", args.KeyPrefix).
 		Bool("prettyLog", args.PrettyLog).
+		Uint("xReadCount", args.XReadCount).
 		Msg("Starting Tolstoyevsky")
 
 	router := fasthttprouter.New()
@@ -58,6 +60,7 @@ func parseArgs() {
 	args.ReadTimeout = *flag.Duration("readTimeout", 24*time.Hour, "Redis read timeout")
 	args.KeyPrefix = *flag.String("keyPrefix", "tolstoyevsky:", "Redis key prefix to avoid name clashing")
 	args.PrettyLog = *flag.Bool("prettyLog", true, "Outputs the log prettily printed and colored (slower)")
+	args.XReadCount = *flag.Uint("xReadCount", 512, "XREAD COUNT value")
 }
 
 func initLogger() {
@@ -79,9 +82,9 @@ type StoryError struct {
 }
 
 type Redis struct {
-	Conn      redis.Conn
-	KeyPrefix string
-	BatchSize uint32
+	Conn       redis.Conn
+	KeyPrefix  string
+	XReadCount uint
 }
 
 type Anchor struct {
@@ -122,7 +125,7 @@ func readStoryHandler(ctx *fasthttp.RequestCtx) {
 
 func readStory(story string, ctx *fasthttp.RequestCtx) {
 	if redisConn, err := redisConnection(); err == nil {
-		rds := Redis{Conn: redisConn, KeyPrefix: args.KeyPrefix, BatchSize: 2 /* TODO */}
+		rds := Redis{Conn: redisConn, KeyPrefix: args.KeyPrefix, XReadCount: args.XReadCount}
 		anchors, err := rds.loadAnchors(story)
 		if err == nil {
 			ctx.SetBodyStreamWriter(func(writer *bufio.Writer) {
@@ -194,7 +197,7 @@ func (redis Redis) pump(anchors []Anchor, writer *bufio.Writer) {
 		firstId := anchor.FirstId
 		for {
 			xReadArgs := []interface{}{
-				"COUNT", redis.BatchSize, "BLOCK", 0, "STREAMS", anchor.Stream, firstId,
+				"COUNT", redis.XReadCount, "BLOCK", 0, "STREAMS", anchor.Stream, firstId,
 			}
 			batch, err := redis.Conn.Do("XREAD", xReadArgs...)
 			if batch == nil {

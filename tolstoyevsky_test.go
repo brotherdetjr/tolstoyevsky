@@ -239,7 +239,7 @@ func TestReadStory(t *testing.T) {
 
 	// given
 	conn := redigomock.NewConn()
-	rds := Redis{Conn: conn, KeyPrefix: "p:", BatchSize: 2}
+	rds := Redis{Conn: conn, KeyPrefix: "p:", XReadCount: 2}
 	anchors := []Anchor{
 		{Stream: []byte("p:stream1"), FirstId: "0", LastId: []byte("67890-1")},
 		{Stream: []byte("p:stream2"), FirstId: "78900-0", LastId: []byte("78901-0")},
@@ -257,7 +257,7 @@ func TestReadStory(t *testing.T) {
 			`{"type":"event","id":"p:stream3-89012-3","payload":{"value": 130}}`
 
 	// interactions
-	conn.Command("XREAD", "COUNT", uint32(2), "BLOCK", 0, "STREAMS", []byte("p:stream1"), "0").
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stream1"), "0").
 		Expect([]interface{}{
 			[]interface{}{
 				"p:stream1",
@@ -279,7 +279,7 @@ func TestReadStory(t *testing.T) {
 				},
 			},
 		})
-	conn.Command("XREAD", "COUNT", uint32(2), "BLOCK", 0, "STREAMS", []byte("p:stream1"), "67890-0").
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stream1"), "67890-0").
 		Expect([]interface{}{
 			[]interface{}{
 				"p:stream1",
@@ -294,7 +294,7 @@ func TestReadStory(t *testing.T) {
 				},
 			},
 		})
-	conn.Command("XREAD", "COUNT", uint32(2), "BLOCK", 0, "STREAMS", []byte("p:stream2"), "78900-0").
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stream2"), "78900-0").
 		Expect([]interface{}{
 			[]interface{}{
 				"p:stream2",
@@ -309,7 +309,7 @@ func TestReadStory(t *testing.T) {
 				},
 			},
 		})
-	conn.Command("XREAD", "COUNT", uint32(2), "BLOCK", 0, "STREAMS", []byte("p:stream3"), "0").
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stream3"), "0").
 		Expect([]interface{}{
 			[]interface{}{
 				"p:stream3",
@@ -331,7 +331,7 @@ func TestReadStory(t *testing.T) {
 				},
 			},
 		})
-	conn.Command("XREAD", "COUNT", uint32(2), "BLOCK", 0, "STREAMS", []byte("p:stream3"), "89012-1").
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stream3"), "89012-1").
 		Expect([]interface{}{
 			[]interface{}{
 				"p:stream3",
