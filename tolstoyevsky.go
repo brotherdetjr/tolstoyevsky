@@ -21,6 +21,7 @@ var args struct {
     ReadTimeout time.Duration
     KeyPrefix string
     PrettyLog bool
+    // TODO OutputBufSize int
 }
 
 const initialId = "$"
@@ -35,6 +36,8 @@ func main() {
         Str("listenAddr", args.ListenAddr).
         Str("redisAddr", args.RedisAddr).
         Dur("readTimeout", args.ReadTimeout).
+        Str("keyPrefix", args.KeyPrefix).
+        Bool("prettyLog", args.PrettyLog).
         Msg("Starting Tolstoyevsky")
 
     router := fasthttprouter.New()
@@ -260,8 +263,9 @@ func (redis Redis) pump(anchors []Anchor, writer *bufio.Writer) {
                         e[0].(string),
                         e[1].([]interface {})[1].(string),
                     )
-                    writer.Flush() // TODO
                 }
+                // TODO how does oboe.js treat trimmed json, when buffer is filled and flushed?
+                writer.Flush()
                 if isLastBatch(entries, anchor.LastId) {
                     break
                 } else {
