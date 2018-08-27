@@ -83,10 +83,10 @@ func TestLoadAnchors(t *testing.T) {
 		{Stream: []byte("prefix:mystream"), FirstId: "12345-1", LastId: []byte("")},
 		{Stream: []byte("a"), FirstId: "b", LastId: []byte("c")},
 	}
-	redis := Redis{Conn: conn, KeyPrefix: "tolstoyevsky:"}
+	ctx := StoryReadCtx{RedisConn: conn, KeyPrefix: "tolstoyevsky:"}
 
 	// when
-	anchors, err := redis.loadAnchors("mystory")
+	anchors, err := ctx.loadAnchors("mystory")
 
 	// then
 	if !cmp.Equal(anchors, expected) {
@@ -108,10 +108,10 @@ func TestLoadAnchorsError(t *testing.T) {
 		0,
 		-1,
 	).ExpectError(fmt.Errorf("simulate error"))
-	redis := Redis{Conn: conn, KeyPrefix: "tolstoyevsky:"}
+	ctx := StoryReadCtx{RedisConn: conn, KeyPrefix: "tolstoyevsky:"}
 
 	// when
-	anchors, err := redis.loadAnchors("mystory")
+	anchors, err := ctx.loadAnchors("mystory")
 
 	// then
 	if anchors != nil {
@@ -239,7 +239,7 @@ func TestReadStory(t *testing.T) {
 
 	// given
 	conn := redigomock.NewConn()
-	rds := Redis{Conn: conn, KeyPrefix: "p:", XReadCount: 2}
+	ctx := StoryReadCtx{RedisConn: conn, KeyPrefix: "p:", XReadCount: 2, EntriesToFlush: 7}
 	anchors := []Anchor{
 		{Stream: []byte("p:stream1"), FirstId: "0", LastId: []byte("67890-1")},
 		{Stream: []byte("p:stream2"), FirstId: "78900-0", LastId: []byte("78901-0")},
@@ -253,8 +253,8 @@ func TestReadStory(t *testing.T) {
 			`{"type":"event","id":"p:stream2-78901-0","payload":{"value": 126}}` +
 			`{"type":"event","id":"p:stream3-89012-0","payload":{"value": 127}}` +
 			`{"type":"event","id":"p:stream3-89012-1","payload":{"value": 128}}` +
-			`{"type":"event","id":"p:stream3-89012-2","payload":{"value": 129}}` +
-			`{"type":"event","id":"p:stream3-89012-3","payload":{"value": 130}}`
+			`{"type":"event","id":"p:stream3-89012-2","payload":{"value": 129}}`
+	// the last entry is not flushed
 
 	// interactions
 	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stream1"), "0").
@@ -355,7 +355,7 @@ func TestReadStory(t *testing.T) {
 		})
 
 	// when
-	rds.pump(anchors, bufio.NewWriter(buf))
+	ctx.pump(anchors, bufio.NewWriter(buf))
 
 	// then
 	if buf.String() != expected {

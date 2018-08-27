@@ -17,13 +17,13 @@ import (
 )
 
 var args struct {
-	ListenAddr  string
-	RedisAddr   string
-	ReadTimeout time.Duration
-	KeyPrefix   string
-	PrettyLog   bool
-	XReadCount  uint
-	// TODO OutputBufSize int
+	ListenAddr     string
+	RedisAddr      string
+	ReadTimeout    time.Duration
+	KeyPrefix      string
+	PrettyLog      bool
+	XReadCount     uint
+	EntriesToFlush uint64
 }
 
 var logger zerolog.Logger
@@ -41,6 +41,7 @@ func main() {
 		Str("keyPrefix", args.KeyPrefix).
 		Bool("prettyLog", args.PrettyLog).
 		Uint("xReadCount", args.XReadCount).
+		Uint64("entriesToFlush", args.EntriesToFlush).
 		Msg("Starting Tolstoyevsky")
 
 	router := fasthttprouter.New()
@@ -54,13 +55,15 @@ func main() {
 }
 
 func parseArgs() {
-	flag.Parse()
 	args.ListenAddr = *flag.String("listenAddr", ":8080", "TCP address to listen to")
 	args.RedisAddr = *flag.String("redisAddr", ":6379", "Redis address:port")
 	args.ReadTimeout = *flag.Duration("readTimeout", 24*time.Hour, "Redis read timeout")
 	args.KeyPrefix = *flag.String("keyPrefix", "tolstoyevsky:", "Redis key prefix to avoid name clashing")
 	args.PrettyLog = *flag.Bool("prettyLog", true, "Outputs the log prettily printed and colored (slower)")
 	args.XReadCount = *flag.Uint("xReadCount", 512, "XREAD COUNT value")
+	args.EntriesToFlush = *flag.Uint64("entriesToFlush", 1, "Entries count to flush the writer after. "+
+		"If 0, flush policy is determined by buffer capacity")
+	flag.Parse()
 }
 
 func initLogger() {
@@ -81,10 +84,13 @@ type StoryError struct {
 	Err   *error
 }
 
-type Redis struct {
-	Conn       redis.Conn
-	KeyPrefix  string
-	XReadCount uint
+type StoryReadCtx struct {
+	RedisConn      redis.Conn
+	KeyPrefix      string
+	XReadCount     uint
+	EntriesToFlush uint64
+	Story          string
+	ConnId         uint64
 }
 
 type Anchor struct {
@@ -125,11 +131,18 @@ func readStoryHandler(ctx *fasthttp.RequestCtx) {
 
 func readStory(story string, ctx *fasthttp.RequestCtx) {
 	if redisConn, err := redisConnection(); err == nil {
-		rds := Redis{Conn: redisConn, KeyPrefix: args.KeyPrefix, XReadCount: args.XReadCount}
-		anchors, err := rds.loadAnchors(story)
+		srCtx := StoryReadCtx{
+			RedisConn:      redisConn,
+			KeyPrefix:      args.KeyPrefix,
+			XReadCount:     args.XReadCount,
+			ConnId:         ctx.ConnID(),
+			EntriesToFlush: args.EntriesToFlush,
+			Story:          story,
+		}
+		anchors, err := srCtx.loadAnchors(story)
 		if err == nil {
 			ctx.SetBodyStreamWriter(func(writer *bufio.Writer) {
-				rds.pump(anchors, writer)
+				srCtx.pump(anchors, writer)
 			})
 		} else {
 			StoryError{Msg: NoAnchorsErr, Story: story, Code: 2, Err: &err}.output(ctx)
@@ -147,8 +160,8 @@ func parseAnchor(anchor []byte) Anchor {
 	return Anchor{Stream: stream, FirstId: firstId, LastId: lastId}
 }
 
-func (redis Redis) loadAnchors(story string) ([]Anchor, error) {
-	result, err := redis.Conn.Do("LRANGE", redis.KeyPrefix+"story:"+story, 0, -1)
+func (ctx StoryReadCtx) loadAnchors(story string) ([]Anchor, error) {
+	result, err := ctx.RedisConn.Do("LRANGE", ctx.KeyPrefix+"story:"+story, 0, -1)
 	if err == nil {
 		anchors := make([]Anchor, len(result.([]interface{})))
 		for i, a := range result.([]interface{}) {
@@ -182,40 +195,47 @@ func lastIdInBatch(batch []interface{}) string {
 	return batch[len(batch)-1].([]interface{})[0].(string)
 }
 
-func toWriter(writer *bufio.Writer, stream []byte, id string, payload []byte) {
+func writeEntry(entry interface{}, writer *bufio.Writer, stream []byte) {
 	writer.WriteString(`{"type":"event","id":"`)
 	writer.Write(stream)
 	writer.WriteString("-")
-	writer.WriteString(id)
+	writer.WriteString(entry.([]interface{})[0].(string))
 	writer.WriteString(`","payload":`)
-	writer.Write(payload)
+	writer.Write(entry.([]interface{})[1].([]interface{})[1].([]byte))
 	writer.WriteString("}")
 }
 
-func (redis Redis) pump(anchors []Anchor, writer *bufio.Writer) {
+func (ctx StoryReadCtx) pump(anchors []Anchor, writer *bufio.Writer) {
+	var entriesWritten uint64 = 0
 	for _, anchor := range anchors {
 		firstId := anchor.FirstId
 		for {
 			xReadArgs := []interface{}{
-				"COUNT", redis.XReadCount, "BLOCK", 0, "STREAMS", anchor.Stream, firstId,
+				"COUNT", ctx.XReadCount, "BLOCK", 0, "STREAMS", anchor.Stream, firstId,
 			}
-			batch, err := redis.Conn.Do("XREAD", xReadArgs...)
+			batch, err := ctx.RedisConn.Do("XREAD", xReadArgs...)
 			if batch == nil {
 				// this guard is useful in test with incorrectly mocked redis
 				// TODO logging and writer output
 			} else if err == nil {
 				entries := toEntries(batch)
 				for _, entry := range entries {
-					e := entry.([]interface{})
-					toWriter(
-						writer,
-						anchor.Stream,
-						e[0].(string),
-						e[1].([]interface{})[1].([]byte),
-					)
+					writeEntry(entry, writer, anchor.Stream)
+					if ctx.EntriesToFlush != 0 {
+						entriesWritten++
+						if entriesWritten%ctx.EntriesToFlush == 0 {
+							logger.Debug().
+								Uint64("entriesWritten", entriesWritten).
+								Uint64("connId", ctx.ConnId).
+								Str("story", ctx.Story).
+								Bytes("stream", anchor.Stream).
+								Uint64("entriesToFlush", ctx.EntriesToFlush).
+								Msg("Flushing entries writer buffer")
+							// TODO how does oboe.js treat trimmed json, when buffer is filled and flushed?
+							writer.Flush()
+						}
+					}
 				}
-				// TODO how does oboe.js treat trimmed json, when buffer is filled and flushed?
-				writer.Flush()
 				if isLastBatch(entries, anchor.LastId) {
 					break
 				} else {
