@@ -79,13 +79,19 @@ func redisConnection() (redis.Conn, error) {
 	return redis.Dial("tcp", args.RedisAddr, redis.DialReadTimeout(args.ReadTimeout))
 }
 
+type HttpContext interface {
+	SetBodyStreamWriter(sw fasthttp.StreamWriter)
+	ConnID() uint64
+	Error(msg string, statusCode int)
+}
+
 type StoryReadCtx struct {
 	RedisConn      redis.Conn
 	KeyPrefix      string
 	XReadCount     uint
 	EntriesToFlush uint64
 	Story          string
-	HttpCtx        *fasthttp.RequestCtx
+	HttpCtx        HttpContext
 	HttpWriter     *bufio.Writer
 }
 
@@ -261,12 +267,10 @@ func (ctx *StoryReadCtx) pump(anchors []Anchor, writer *bufio.Writer) {
 }
 
 func (ctx *StoryReadCtx) logFlush(entriesWritten uint64, anchor Anchor) {
-	log := logger.Debug().
-		Uint64("entriesWritten", entriesWritten)
-	if ctx.HttpCtx != nil { // not defined in unit tests
-		log.Uint64("connId", ctx.HttpCtx.ConnID())
-	}
-	log.Str("story", ctx.Story).
+	logger.Debug().
+		Uint64("entriesWritten", entriesWritten).
+		Uint64("connId", ctx.HttpCtx.ConnID()).
+		Str("story", ctx.Story).
 		Bytes("stream", anchor.Stream).
 		Uint64("entriesToFlush", ctx.EntriesToFlush).
 		Msg("Flushing entries writer buffer")

@@ -6,8 +6,25 @@ import (
 	"fmt"
 	"github.com/google/go-cmp/cmp"
 	"github.com/rafaeljusto/redigomock"
+	"github.com/valyala/fasthttp"
 	"testing"
 )
+
+type HttpContextMock struct {
+	ConnId uint64
+}
+
+func (HttpContextMock) SetBodyStreamWriter(sw fasthttp.StreamWriter) {
+	panic("should not be called")
+}
+
+func (m HttpContextMock) ConnID() uint64 {
+	return m.ConnId
+}
+
+func (HttpContextMock) Error(msg string, statusCode int) {
+	panic("should not be called")
+}
 
 func TestParseAnchor(t *testing.T) {
 	t.Parallel()
@@ -239,7 +256,13 @@ func TestPump(t *testing.T) {
 
 	// given
 	conn := redigomock.NewConn()
-	ctx := StoryReadCtx{RedisConn: conn, KeyPrefix: "p:", XReadCount: 2, EntriesToFlush: 7}
+	ctx := StoryReadCtx{
+		RedisConn:      conn,
+		KeyPrefix:      "p:",
+		XReadCount:     2,
+		EntriesToFlush: 7,
+		HttpCtx:        &HttpContextMock{ConnId: 42},
+	}
 	anchors := []Anchor{
 		{Stream: []byte("p:stream1"), FirstId: "0", LastId: []byte("67890-1")},
 		{Stream: []byte("p:stream2"), FirstId: "78900-0", LastId: []byte("78901-0")},
