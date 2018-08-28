@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"flag"
-	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -77,45 +79,20 @@ func redisConnection() (redis.Conn, error) {
 	return redis.Dial("tcp", args.RedisAddr, redis.DialReadTimeout(args.ReadTimeout))
 }
 
-type StoryError struct {
-	Msg   string
-	Story string
-	Code  uint16
-	Err   *error
-}
-
 type StoryReadCtx struct {
 	RedisConn      redis.Conn
 	KeyPrefix      string
 	XReadCount     uint
 	EntriesToFlush uint64
 	Story          string
-	ConnId         uint64
+	HttpCtx        *fasthttp.RequestCtx
+	HttpWriter     *bufio.Writer
 }
 
 type Anchor struct {
 	Stream  []byte
 	FirstId string
 	LastId  []byte
-}
-
-const RedisConnErr = "failed to create connection to Redis"
-const NoAnchorsErr = "failed to load anchors for the story"
-
-func (e StoryError) output(ctx *fasthttp.RequestCtx) {
-	errId := uuid.Must(uuid.NewV4()).String()
-	logger.Error().
-		Err(*e.Err).
-		Str("story", e.Story).
-		Uint64("connId", ctx.ConnID()).
-		Str("errId", errId).
-		Uint16("code", e.Code).
-		Msg(e.Msg)
-	ctx.Error(
-		fmt.Sprintf(`{"type":"error","code":%d,"msg":%q,"cause":%q,"id":%q}`,
-			e.Code, e.Msg, e.Err, errId),
-		500,
-	)
 }
 
 func readStoryHandler(ctx *fasthttp.RequestCtx) {
@@ -129,26 +106,28 @@ func readStoryHandler(ctx *fasthttp.RequestCtx) {
 	readStory(story, ctx)
 }
 
-func readStory(story string, ctx *fasthttp.RequestCtx) {
+func readStory(story string, httpCtx *fasthttp.RequestCtx) {
 	if redisConn, err := redisConnection(); err == nil {
-		srCtx := StoryReadCtx{
+		ctx := StoryReadCtx{
 			RedisConn:      redisConn,
 			KeyPrefix:      args.KeyPrefix,
 			XReadCount:     args.XReadCount,
-			ConnId:         ctx.ConnID(),
+			HttpCtx:        httpCtx,
 			EntriesToFlush: args.EntriesToFlush,
 			Story:          story,
 		}
-		anchors, err := srCtx.loadAnchors(story)
+		anchors, err := ctx.loadAnchors(story)
 		if err == nil {
-			ctx.SetBodyStreamWriter(func(writer *bufio.Writer) {
-				srCtx.pump(anchors, writer)
+			httpCtx.SetBodyStreamWriter(func(writer *bufio.Writer) {
+				ctx.HttpWriter = writer
+				ctx.pump(anchors, writer)
 			})
 		} else {
-			StoryError{Msg: NoAnchorsErr, Story: story, Code: 2, Err: &err}.output(ctx)
+			ctx.writeError(err, "failed to load anchors for the story")
 		}
 	} else {
-		StoryError{Msg: RedisConnErr, Story: story, Code: 1, Err: &err}.output(ctx)
+		ctx := StoryReadCtx{HttpCtx: httpCtx, Story: story}
+		ctx.writeError(err, "failed to create connection to Redis")
 	}
 }
 
@@ -158,19 +137,6 @@ func parseAnchor(anchor []byte) Anchor {
 	firstId := string(trimmed[:bytes.Index(trimmed, semicolon)])
 	lastId := trimmed[len(firstId)+1:]
 	return Anchor{Stream: stream, FirstId: firstId, LastId: lastId}
-}
-
-func (ctx StoryReadCtx) loadAnchors(story string) ([]Anchor, error) {
-	result, err := ctx.RedisConn.Do("LRANGE", ctx.KeyPrefix+"story:"+story, 0, -1)
-	if err == nil {
-		anchors := make([]Anchor, len(result.([]interface{})))
-		for i, a := range result.([]interface{}) {
-			anchors[i] = parseAnchor(a.([]byte))
-		}
-		return anchors, nil
-	} else {
-		return nil, err
-	}
 }
 
 func toEntries(result interface{}) []interface{} {
@@ -205,7 +171,61 @@ func writeEntry(entry interface{}, writer *bufio.Writer, stream []byte) {
 	writer.WriteString("}")
 }
 
-func (ctx StoryReadCtx) pump(anchors []Anchor, writer *bufio.Writer) {
+func (ctx *StoryReadCtx) writeError(err error, description string, keyValues ...string) {
+	errId := uuid.Must(uuid.NewV4()).String()
+	var log = logger.Error().
+		Err(err).
+		Str("story", ctx.Story).
+		Uint64("connId", ctx.HttpCtx.ConnID()).
+		Str("errId", errId)
+	var msg strings.Builder
+	msg.WriteString(`{"type":"error","msg":"`)
+	msg.WriteString(description)
+	msg.WriteString(`","cause":`)
+	msg.WriteString(strconv.Quote(err.Error()))
+	msg.WriteString(`,"id":"`)
+	msg.WriteString(errId)
+	msg.WriteByte('"')
+	var k string
+	for i, kv := range keyValues {
+		if i%2 == 0 {
+			k = kv
+		} else {
+			log.Str(k, kv)
+			msg.WriteString(`,"`)
+			msg.WriteString(k)
+			msg.WriteString(`":"`)
+			msg.WriteString(kv)
+			msg.WriteByte('"')
+		}
+	}
+	msg.WriteByte('}')
+	log.Msg(description)
+	if ctx.HttpWriter != nil {
+		ctx.HttpWriter.WriteString(msg.String())
+	} else {
+		ctx.HttpCtx.Error(msg.String(), 500)
+	}
+}
+
+func (ctx *StoryReadCtx) loadAnchors(story string) ([]Anchor, error) {
+	result, err := ctx.RedisConn.Do("LRANGE", ctx.KeyPrefix+"story:"+story, 0, -1)
+	if err == nil {
+		if len(result.([]interface{})) == 0 {
+			return nil, errors.New("no anchors")
+		} else {
+			anchors := make([]Anchor, len(result.([]interface{})))
+			for i, a := range result.([]interface{}) {
+				anchors[i] = parseAnchor(a.([]byte))
+			}
+			return anchors, nil
+		}
+	} else {
+		return nil, err
+	}
+}
+
+func (ctx *StoryReadCtx) pump(anchors []Anchor, writer *bufio.Writer) {
 	var entriesWritten uint64 = 0
 	for _, anchor := range anchors {
 		firstId := anchor.FirstId
@@ -214,23 +234,14 @@ func (ctx StoryReadCtx) pump(anchors []Anchor, writer *bufio.Writer) {
 				"COUNT", ctx.XReadCount, "BLOCK", 0, "STREAMS", anchor.Stream, firstId,
 			}
 			batch, err := ctx.RedisConn.Do("XREAD", xReadArgs...)
-			if batch == nil {
-				// this guard is useful in test with incorrectly mocked redis
-				// TODO logging and writer output
-			} else if err == nil {
+			if batch != nil && err == nil {
 				entries := toEntries(batch)
 				for _, entry := range entries {
 					writeEntry(entry, writer, anchor.Stream)
 					if ctx.EntriesToFlush != 0 {
 						entriesWritten++
 						if entriesWritten%ctx.EntriesToFlush == 0 {
-							logger.Debug().
-								Uint64("entriesWritten", entriesWritten).
-								Uint64("connId", ctx.ConnId).
-								Str("story", ctx.Story).
-								Bytes("stream", anchor.Stream).
-								Uint64("entriesToFlush", ctx.EntriesToFlush).
-								Msg("Flushing entries writer buffer")
+							ctx.logFlush(entriesWritten, anchor)
 							// TODO how does oboe.js treat trimmed json, when buffer is filled and flushed?
 							writer.Flush()
 						}
@@ -242,9 +253,21 @@ func (ctx StoryReadCtx) pump(anchors []Anchor, writer *bufio.Writer) {
 					firstId = lastIdInBatch(entries)
 				}
 			} else {
-				// TODO
+				ctx.writeError(err, "failed to XREAD", "stream", string(anchor.Stream))
 				return
 			}
 		}
 	}
+}
+
+func (ctx *StoryReadCtx) logFlush(entriesWritten uint64, anchor Anchor) {
+	log := logger.Debug().
+		Uint64("entriesWritten", entriesWritten)
+	if ctx.HttpCtx != nil { // not defined in unit tests
+		log.Uint64("connId", ctx.HttpCtx.ConnID())
+	}
+	log.Str("story", ctx.Story).
+		Bytes("stream", anchor.Stream).
+		Uint64("entriesToFlush", ctx.EntriesToFlush).
+		Msg("Flushing entries writer buffer")
 }

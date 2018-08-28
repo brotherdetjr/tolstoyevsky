@@ -234,7 +234,7 @@ func TestLastIdInBatchSingleEntry(t *testing.T) {
 	}
 }
 
-func TestReadStory(t *testing.T) {
+func TestPump(t *testing.T) {
 	t.Parallel()
 
 	// given
