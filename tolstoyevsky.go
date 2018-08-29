@@ -6,8 +6,11 @@ import (
 	"errors"
 	"flag"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -26,11 +29,14 @@ var args struct {
 	PrettyLog      bool
 	XReadCount     uint
 	EntriesToFlush uint64
+	Debug          bool
 }
 
 var logger zerolog.Logger
 
 var semicolon = []byte{';'}
+
+var contexts sync.Map
 
 func main() {
 	parseArgs()
@@ -44,12 +50,32 @@ func main() {
 		Bool("prettyLog", args.PrettyLog).
 		Uint("xReadCount", args.XReadCount).
 		Uint64("entriesToFlush", args.EntriesToFlush).
+		Bool("debug", args.Debug).
 		Msg("Starting Tolstoyevsky")
 
 	router := fasthttprouter.New()
 	router.GET("/stories/:story", readStoryHandler)
 
-	if err := fasthttp.ListenAndServe(args.ListenAddr, router.Handler); err != nil {
+	httpServer := &fasthttp.Server{Handler: router.Handler}
+
+	var shutdownCh = make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, syscall.SIGTERM)
+	signal.Notify(shutdownCh, syscall.SIGINT)
+	go func() {
+		for sig := range shutdownCh {
+			// Will appear soon, hopefully. See https://github.com/valyala/fasthttp/commit/e3d61d58
+			// s.Shutdown()
+			contexts.Range(func(key, value interface{}) bool {
+				// TODO use INFO level
+				value.(*StoryReadCtx).writeError(errors.New(sig.String()), "Shutting down")
+				return true
+			})
+			time.Sleep(2 * time.Second)
+			os.Exit(0)
+		}
+	}()
+
+	if err := httpServer.ListenAndServe(args.ListenAddr); err != nil {
 		logger.Fatal().
 			Err(err).
 			Msg("Error in ListenAndServe")
@@ -65,6 +91,7 @@ func parseArgs() {
 	args.XReadCount = *flag.Uint("xReadCount", 512, "XREAD COUNT value")
 	args.EntriesToFlush = *flag.Uint64("entriesToFlush", 1, "Entries count to flush the writer after. "+
 		"If 0, flush policy is determined by buffer capacity")
+	args.Debug = *flag.Bool("debug", false, "sets log level to debug")
 	flag.Parse()
 }
 
@@ -72,6 +99,10 @@ func initLogger() {
 	logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
 	if args.PrettyLog {
 		logger = logger.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	}
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	if args.Debug {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
 }
 
@@ -122,6 +153,7 @@ func readStory(story string, httpCtx *fasthttp.RequestCtx) {
 			EntriesToFlush: args.EntriesToFlush,
 			Story:          story,
 		}
+		contexts.Store(httpCtx.ConnID(), &ctx)
 		anchors, err := ctx.loadAnchors(story)
 		if err == nil {
 			httpCtx.SetBodyStreamWriter(func(writer *bufio.Writer) {
@@ -209,6 +241,7 @@ func (ctx *StoryReadCtx) writeError(err error, description string, keyValues ...
 	log.Msg(description)
 	if ctx.HttpWriter != nil {
 		ctx.HttpWriter.WriteString(msg.String())
+		ctx.HttpWriter.Flush()
 	} else {
 		ctx.HttpCtx.Error(msg.String(), 500)
 	}
