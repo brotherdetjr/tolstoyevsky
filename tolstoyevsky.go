@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"flag"
+	"github.com/satori/go.uuid"
 	"os"
 	"os/signal"
 	"strconv"
@@ -17,7 +18,6 @@ import (
 	"github.com/buaazp/fasthttprouter"
 	"github.com/gomodule/redigo/redis"
 	"github.com/rs/zerolog"
-	"github.com/satori/go.uuid"
 	"github.com/valyala/fasthttp"
 )
 
@@ -30,6 +30,7 @@ var args struct {
 	XReadCount     uint
 	EntriesToFlush uint64
 	Debug          bool
+	ShutdownDelay  time.Duration
 }
 
 var logger zerolog.Logger
@@ -51,6 +52,7 @@ func main() {
 		Uint("xReadCount", args.XReadCount).
 		Uint64("entriesToFlush", args.EntriesToFlush).
 		Bool("debug", args.Debug).
+		Dur("shutdownDelay", args.ShutdownDelay).
 		Msg("Starting Tolstoyevsky")
 
 	router := fasthttprouter.New()
@@ -58,28 +60,33 @@ func main() {
 
 	httpServer := &fasthttp.Server{Handler: router.Handler}
 
-	var shutdownCh = make(chan os.Signal, 1)
-	signal.Notify(shutdownCh, syscall.SIGTERM)
-	signal.Notify(shutdownCh, syscall.SIGINT)
-	go func() {
-		for sig := range shutdownCh {
-			// Will appear soon, hopefully. See https://github.com/valyala/fasthttp/commit/e3d61d58
-			// s.Shutdown()
-			contexts.Range(func(key, value interface{}) bool {
-				// TODO use INFO level
-				value.(*StoryReadCtx).writeError(errors.New(sig.String()), "Shutting down")
-				return true
-			})
-			time.Sleep(2 * time.Second)
-			os.Exit(0)
-		}
-	}()
+	registerShutdownHandler(httpServer)
 
 	if err := httpServer.ListenAndServe(args.ListenAddr); err != nil {
 		logger.Fatal().
 			Err(err).
 			Msg("Error in ListenAndServe")
 	}
+}
+
+//noinspection GoUnusedParameter
+func registerShutdownHandler(httpServer *fasthttp.Server) {
+	var shutdownCh = make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, syscall.SIGTERM)
+	signal.Notify(shutdownCh, syscall.SIGINT)
+	go func() {
+		for sig := range shutdownCh {
+			// Will appear soon, hopefully. See https://github.com/valyala/fasthttp/commit/e3d61d58
+			// httpServer.Shutdown()
+			contexts.Range(func(key, value interface{}) bool {
+				value.(*StoryReadCtx).writeInfo("Closing connection", "signal", sig.String())
+				return true
+			})
+			logger.Info().Msg("Shutting down")
+			time.Sleep(args.ShutdownDelay)
+			os.Exit(0)
+		}
+	}()
 }
 
 func parseArgs() {
@@ -91,7 +98,9 @@ func parseArgs() {
 	args.XReadCount = *flag.Uint("xReadCount", 512, "XREAD COUNT value")
 	args.EntriesToFlush = *flag.Uint64("entriesToFlush", 1, "Entries count to flush the writer after. "+
 		"If 0, flush policy is determined by buffer capacity")
-	args.Debug = *flag.Bool("debug", false, "sets log level to debug")
+	args.Debug = *flag.Bool("debug", false, "Sets log level to debug")
+	args.ShutdownDelay = *flag.Duration("shutdownDelay", 2*time.Second, "Time to wait until everything has "+
+		"been gracefully shut down.")
 	flag.Parse()
 }
 
@@ -209,6 +218,43 @@ func writeEntry(entry interface{}, writer *bufio.Writer, stream []byte) {
 	writer.WriteString("}")
 }
 
+type KeyValueWriter interface {
+	Str(k, v string) *zerolog.Event
+}
+
+func writeKeyValues(msg *strings.Builder, log KeyValueWriter, keyValues ...string) {
+	var k string
+	for i, kv := range keyValues {
+		if i%2 == 0 {
+			k = kv
+		} else {
+			log.Str(k, kv)
+			msg.WriteString(`,"`)
+			msg.WriteString(k)
+			msg.WriteString(`":"`)
+			msg.WriteString(kv)
+			msg.WriteByte('"')
+		}
+	}
+}
+
+func (ctx *StoryReadCtx) writeInfo(description string, keyValues ...string) {
+	var log = logger.Info().
+		Str("story", ctx.Story).
+		Uint64("connId", ctx.HttpCtx.ConnID())
+	var msg strings.Builder
+	msg.WriteString(`{"type":"info","msg":"`)
+	msg.WriteString(description)
+	msg.WriteByte('"')
+	writeKeyValues(&msg, log, keyValues...)
+	msg.WriteByte('}')
+	log.Msg(description)
+	if ctx.HttpWriter != nil {
+		ctx.HttpWriter.WriteString(msg.String())
+		ctx.HttpWriter.Flush()
+	}
+}
+
 func (ctx *StoryReadCtx) writeError(err error, description string, keyValues ...string) {
 	errId := uuid.Must(uuid.NewV4()).String()
 	var log = logger.Error().
@@ -224,19 +270,7 @@ func (ctx *StoryReadCtx) writeError(err error, description string, keyValues ...
 	msg.WriteString(`,"id":"`)
 	msg.WriteString(errId)
 	msg.WriteByte('"')
-	var k string
-	for i, kv := range keyValues {
-		if i%2 == 0 {
-			k = kv
-		} else {
-			log.Str(k, kv)
-			msg.WriteString(`,"`)
-			msg.WriteString(k)
-			msg.WriteString(`":"`)
-			msg.WriteString(kv)
-			msg.WriteByte('"')
-		}
-	}
+	writeKeyValues(&msg, log, keyValues...)
 	msg.WriteByte('}')
 	log.Msg(description)
 	if ctx.HttpWriter != nil {
