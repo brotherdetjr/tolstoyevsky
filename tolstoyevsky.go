@@ -76,13 +76,13 @@ func registerShutdownHandler(httpServer *fasthttp.Server) {
 	signal.Notify(shutdownCh, syscall.SIGINT)
 	go func() {
 		for sig := range shutdownCh {
-			// Will appear soon, hopefully. See https://github.com/valyala/fasthttp/commit/e3d61d58
-			// httpServer.Shutdown()
 			contexts.Range(func(key, value interface{}) bool {
 				value.(*StoryReadCtx).writeInfo("Closing connection", "signal", sig.String())
 				return true
 			})
 			logger.Info().Msg("Shutting down")
+			// Seems buggy for now, see https://github.com/valyala/fasthttp/issues/406
+			// httpServer.Shutdown()
 			time.Sleep(args.ShutdownDelay)
 			os.Exit(0)
 		}
