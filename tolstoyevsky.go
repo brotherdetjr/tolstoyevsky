@@ -77,7 +77,9 @@ func registerShutdownHandler(httpServer *fasthttp.Server) {
 	go func() {
 		for sig := range shutdownCh {
 			contexts.Range(func(key, value interface{}) bool {
-				value.(*StoryReadCtx).writeInfo("Closing connection", "signal", sig.String())
+				ctx := value.(*StoryReadCtx)
+				ctx.writeInfo("Closing connection", "signal", sig.String())
+				ctx.HttpWriter.Flush()
 				return true
 			})
 			logger.Info().Msg("Shutting down")
@@ -251,7 +253,6 @@ func (ctx *StoryReadCtx) writeInfo(description string, keyValues ...string) {
 	log.Msg(description)
 	if ctx.HttpWriter != nil {
 		ctx.HttpWriter.WriteString(msg.String())
-		ctx.HttpWriter.Flush()
 	}
 }
 
@@ -275,7 +276,6 @@ func (ctx *StoryReadCtx) writeError(err error, description string, keyValues ...
 	log.Msg(description)
 	if ctx.HttpWriter != nil {
 		ctx.HttpWriter.WriteString(msg.String())
-		ctx.HttpWriter.Flush()
 	} else {
 		ctx.HttpCtx.Error(msg.String(), 500)
 	}
@@ -327,6 +327,7 @@ func (ctx *StoryReadCtx) pump(anchors []Anchor, writer *bufio.Writer) {
 				}
 			} else {
 				ctx.writeError(err, "failed to XREAD", "stream", string(anchor.Stream))
+				writer.Flush()
 				return
 			}
 		}
