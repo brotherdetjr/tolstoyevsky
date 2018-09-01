@@ -3,12 +3,24 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/google/go-cmp/cmp"
 	"github.com/rafaeljusto/redigomock"
+	"github.com/satori/go.uuid"
 	"github.com/valyala/fasthttp"
 	"testing"
 )
+
+type ParsedError struct {
+	Type  string `json:"type"`
+	Msg   string `json:"msg"`
+	Cause string `json:"cause"`
+	Id    string `json:"id"`
+	Key1  string `json:"key1"`
+	Key2  string `json:"key2"`
+}
 
 type HttpContextMock struct {
 	ConnId uint64
@@ -248,6 +260,71 @@ func TestLastIdInBatchSingleEntry(t *testing.T) {
 	// expect
 	if lastIdInBatch(batch) != "67890-0" {
 		t.Fail()
+	}
+}
+
+func TestWriteInfo(t *testing.T) {
+	t.Parallel()
+
+	// given
+	buf := new(bytes.Buffer)
+	ctx := StoryReadCtx{
+		Story:      "myStory",
+		HttpCtx:    &HttpContextMock{ConnId: 42},
+		HttpWriter: bufio.NewWriter(buf),
+	}
+	expected := `{"type":"info","msg":"Some description","key1":"value1","key2":"value2"}`
+
+	// when
+	ctx.writeInfo("Some description", "key1", "value1", "key2", "value2")
+	ctx.HttpWriter.Flush()
+
+	// then
+	if buf.String() != expected {
+		t.Errorf("buf.toString(): %s != %s", buf.String(), expected)
+	}
+
+}
+
+func TestWriteError(t *testing.T) {
+	t.Parallel()
+
+	// given
+	buf := new(bytes.Buffer)
+	ctx := StoryReadCtx{
+		Story:      "myStory",
+		HttpCtx:    &HttpContextMock{ConnId: 42},
+		HttpWriter: bufio.NewWriter(buf),
+	}
+	parsed := &ParsedError{}
+
+	// when
+	ctx.writeError(
+		errors.New("some error"),
+		"Some description",
+		"key1", "value1", "key2", "value2",
+	)
+	ctx.HttpWriter.Flush()
+	json.NewDecoder(buf).Decode(parsed)
+
+	// then
+	if parsed.Type != "error" {
+		t.Errorf("type: %s != error", parsed.Type)
+	}
+	if parsed.Msg != "Some description" {
+		t.Errorf("msg: %s != Some description", parsed.Msg)
+	}
+	if parsed.Cause != "some error" {
+		t.Errorf("cause: %s != some error", parsed.Cause)
+	}
+	if _, err := uuid.FromString(parsed.Id); err != nil {
+		t.Errorf("id: %s is not valid UUID", parsed.Id)
+	}
+	if parsed.Key1 != "value1" {
+		t.Errorf("key1: %s != value1", parsed.Key1)
+	}
+	if parsed.Key2 != "value2" {
+		t.Errorf("key2: %s != value2", parsed.Key2)
 	}
 }
 
