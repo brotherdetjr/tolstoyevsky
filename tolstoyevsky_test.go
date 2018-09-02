@@ -38,6 +38,10 @@ func (HttpContextMock) Error(msg string, statusCode int) {
 	panic("should not be called")
 }
 
+func (HttpContextMock) ResetBody() {
+	// nothing
+}
+
 func TestParseAnchor(t *testing.T) {
 	t.Parallel()
 

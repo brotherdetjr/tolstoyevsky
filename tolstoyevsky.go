@@ -30,7 +30,6 @@ var args struct {
 	XReadCount     uint
 	EntriesToFlush uint64
 	Debug          bool
-	ShutdownDelay  time.Duration
 }
 
 var logger zerolog.Logger
@@ -52,7 +51,6 @@ func main() {
 		Uint("xReadCount", args.XReadCount).
 		Uint64("entriesToFlush", args.EntriesToFlush).
 		Bool("debug", args.Debug).
-		Dur("shutdownDelay", args.ShutdownDelay).
 		Msg("Starting Tolstoyevsky")
 
 	router := fasthttprouter.New()
@@ -60,35 +58,32 @@ func main() {
 
 	httpServer := &fasthttp.Server{Handler: router.Handler}
 
-	registerShutdownHandler(httpServer)
+	go func() {
+		if err := httpServer.ListenAndServe(args.ListenAddr); err != nil {
+			logger.Fatal().
+				Err(err).
+				Msg("Error in ListenAndServe")
+		}
+	}()
 
-	if err := httpServer.ListenAndServe(args.ListenAddr); err != nil {
-		logger.Fatal().
-			Err(err).
-			Msg("Error in ListenAndServe")
-	}
+	handleShutdown(httpServer)
+
 }
 
-//noinspection GoUnusedParameter
-func registerShutdownHandler(httpServer *fasthttp.Server) {
+func handleShutdown(httpServer *fasthttp.Server) {
 	var shutdownCh = make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, syscall.SIGTERM)
 	signal.Notify(shutdownCh, syscall.SIGINT)
-	go func() {
-		for sig := range shutdownCh {
-			contexts.Range(func(key, value interface{}) bool {
-				ctx := value.(*StoryReadCtx)
-				ctx.writeInfo("Closing connection", "signal", sig.String())
-				ctx.HttpWriter.Flush()
-				return true
-			})
-			logger.Info().Msg("Shutting down")
-			// Seems buggy for now, see https://github.com/valyala/fasthttp/issues/406
-			// httpServer.Shutdown()
-			time.Sleep(args.ShutdownDelay)
-			os.Exit(0)
-		}
-	}()
+	sig := <-shutdownCh
+	logger.Info().Msg("Shutting down")
+	contexts.Range(func(key, value interface{}) bool {
+		ctx := value.(*StoryReadCtx)
+		ctx.writeInfo("Closing connection", "signal", sig.String())
+		ctx.HttpWriter.Flush()
+		ctx.HttpCtx.ResetBody()
+		return true
+	})
+	httpServer.Shutdown()
 }
 
 func parseArgs() {
@@ -101,8 +96,6 @@ func parseArgs() {
 	args.EntriesToFlush = *flag.Uint64("entriesToFlush", 1, "Entries count to flush the writer after. "+
 		"If 0, flush policy is determined by buffer capacity")
 	args.Debug = *flag.Bool("debug", false, "Sets log level to debug")
-	args.ShutdownDelay = *flag.Duration("shutdownDelay", 2*time.Second, "Time to wait until everything has "+
-		"been gracefully shut down.")
 	flag.Parse()
 }
 
@@ -125,6 +118,7 @@ type HttpContext interface {
 	SetBodyStreamWriter(sw fasthttp.StreamWriter)
 	ConnID() uint64
 	Error(msg string, statusCode int)
+	ResetBody()
 }
 
 type StoryReadCtx struct {
