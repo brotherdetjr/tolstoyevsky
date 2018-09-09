@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"errors"
 	"flag"
+	"github.com/buaazp/fasthttprouter"
+	"github.com/gomodule/redigo/redis"
+	"github.com/rs/zerolog"
 	"github.com/satori/go.uuid"
+	"github.com/valyala/fasthttp"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,12 +15,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
-
-	"github.com/buaazp/fasthttprouter"
-	"github.com/gomodule/redigo/redis"
-	"github.com/rs/zerolog"
-	"github.com/valyala/fasthttp"
 )
 
 var args struct {
@@ -131,10 +127,10 @@ type StoryReadCtx struct {
 	HttpWriter     *bufio.Writer
 }
 
-type Anchor struct {
-	Stream  []byte
-	FirstId string
-	LastId  []byte
+type Patch struct {
+	FirstEntryId string
+	LastEntryId  string
+	Id           string
 }
 
 func readStoryHandler(ctx *fasthttp.RequestCtx) {
@@ -159,14 +155,13 @@ func readStory(story string, httpCtx *fasthttp.RequestCtx) {
 			Story:          story,
 		}
 		contexts.Store(httpCtx.ConnID(), &ctx)
-		anchors, err := ctx.loadAnchors(story)
 		if err == nil {
 			httpCtx.SetBodyStreamWriter(func(writer *bufio.Writer) {
 				ctx.HttpWriter = writer
-				ctx.pump(anchors, writer)
+				ctx.pump([]Patch{}, writer)
 			})
 		} else {
-			ctx.writeError(err, "failed to load anchors for the story")
+			ctx.writeError(err, "failed to load patches for the story")
 		}
 	} else {
 		ctx := StoryReadCtx{HttpCtx: httpCtx, Story: story}
@@ -174,39 +169,17 @@ func readStory(story string, httpCtx *fasthttp.RequestCtx) {
 	}
 }
 
-func parseAnchor(anchor []byte) Anchor {
-	stream := anchor[:bytes.Index(anchor, semicolon)]
-	trimmed := anchor[len(stream)+1:]
-	firstId := string(trimmed[:bytes.Index(trimmed, semicolon)])
-	lastId := trimmed[len(firstId)+1:]
-	return Anchor{Stream: stream, FirstId: firstId, LastId: lastId}
-}
-
 func toEntries(result interface{}) []interface{} {
 	return result.([]interface{})[0].([]interface{})[1].([]interface{})
-}
-
-func strByteCmp(a string, b []byte) bool {
-	abp := *(*[]byte)(unsafe.Pointer(&a))
-	return bytes.Equal(abp, b)
-}
-
-func isLastBatch(batch []interface{}, lastId []byte) bool {
-	for _, entry := range batch {
-		if strByteCmp(entry.([]interface{})[0].(string), lastId) {
-			return true
-		}
-	}
-	return false
 }
 
 func lastIdInBatch(batch []interface{}) string {
 	return batch[len(batch)-1].([]interface{})[0].(string)
 }
 
-func writeEntry(entry interface{}, writer *bufio.Writer, stream []byte) {
+func writeEntry(entry interface{}, writer *bufio.Writer, key string) {
 	writer.WriteString(`{"type":"event","id":"`)
-	writer.Write(stream)
+	writer.WriteString(key)
 	writer.WriteString("-")
 	writer.WriteString(entry.([]interface{})[0].(string))
 	writer.WriteString(`","payload":`)
@@ -275,65 +248,44 @@ func (ctx *StoryReadCtx) writeError(err error, description string, keyValues ...
 	}
 }
 
-func (ctx *StoryReadCtx) loadAnchors(story string) ([]Anchor, error) {
-	result, err := ctx.RedisConn.Do("LRANGE", ctx.KeyPrefix+"story:"+story, 0, -1)
-	if err == nil {
-		if len(result.([]interface{})) == 0 {
-			return nil, errors.New("no anchors")
-		} else {
-			anchors := make([]Anchor, len(result.([]interface{})))
-			for i, a := range result.([]interface{}) {
-				anchors[i] = parseAnchor(a.([]byte))
-			}
-			return anchors, nil
-		}
-	} else {
-		return nil, err
-	}
-}
-
-func (ctx *StoryReadCtx) pump(anchors []Anchor, writer *bufio.Writer) {
+func (ctx *StoryReadCtx) pump(patches []Patch, writer *bufio.Writer) {
 	var entriesWritten uint64 = 0
-	for _, anchor := range anchors {
-		firstId := anchor.FirstId
-		for {
-			xReadArgs := []interface{}{
-				"COUNT", ctx.XReadCount, "BLOCK", 0, "STREAMS", anchor.Stream, firstId,
-			}
-			batch, err := ctx.RedisConn.Do("XREAD", xReadArgs...)
-			if batch != nil && err == nil {
-				entries := toEntries(batch)
-				for _, entry := range entries {
-					writeEntry(entry, writer, anchor.Stream)
-					if ctx.EntriesToFlush != 0 {
-						entriesWritten++
-						if entriesWritten%ctx.EntriesToFlush == 0 {
-							ctx.logFlush(entriesWritten, anchor)
-							// TODO how does oboe.js treat trimmed json, when buffer is filled and flushed?
-							writer.Flush()
-						}
+	key := ctx.KeyPrefix + "stories:" + ctx.Story
+	firstId := "0"
+	for {
+		xReadArgs := []interface{}{
+			"COUNT", ctx.XReadCount, "BLOCK", 0, "STREAMS", key, firstId,
+		}
+		batch, err := ctx.RedisConn.Do("XREAD", xReadArgs...)
+		if batch != nil && err == nil {
+			entries := toEntries(batch)
+			for _, entry := range entries {
+				writeEntry(entry, writer, key)
+				if ctx.EntriesToFlush != 0 {
+					entriesWritten++
+					if entriesWritten%ctx.EntriesToFlush == 0 {
+						ctx.logFlush(entriesWritten)
+						// TODO how does oboe.js treat trimmed json, when buffer is filled and flushed?
+						writer.Flush()
 					}
 				}
-				if isLastBatch(entries, anchor.LastId) {
-					break
-				} else {
-					firstId = lastIdInBatch(entries)
-				}
-			} else {
-				ctx.writeError(err, "failed to XREAD", "stream", string(anchor.Stream))
-				writer.Flush()
-				return
 			}
+			firstId = lastIdInBatch(entries)
+		} else if err != nil {
+			ctx.writeError(err, "failed to XREAD", "stream", key)
+			writer.Flush()
+			return
+		} else {
+			break
 		}
 	}
 }
 
-func (ctx *StoryReadCtx) logFlush(entriesWritten uint64, anchor Anchor) {
+func (ctx *StoryReadCtx) logFlush(entriesWritten uint64) {
 	logger.Debug().
 		Uint64("entriesWritten", entriesWritten).
 		Uint64("connId", ctx.HttpCtx.ConnID()).
 		Str("story", ctx.Story).
-		Bytes("stream", anchor.Stream).
 		Uint64("entriesToFlush", ctx.EntriesToFlush).
 		Msg("Flushing entries writer buffer")
 }
