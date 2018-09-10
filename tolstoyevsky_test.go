@@ -9,6 +9,7 @@ import (
 	"github.com/rafaeljusto/redigomock"
 	"github.com/satori/go.uuid"
 	"github.com/valyala/fasthttp"
+	"strings"
 	"testing"
 )
 
@@ -23,10 +24,11 @@ type ParsedError struct {
 
 type HttpContextMock struct {
 	ConnId uint64
+	Buffer *bytes.Buffer
 }
 
 func (HttpContextMock) SetBodyStreamWriter(sw fasthttp.StreamWriter) {
-	panic("should not be called")
+	panic("func (HttpContextMock) SetBodyStreamWriter(sw fasthttp.StreamWriter) should not be called")
 }
 
 func (m HttpContextMock) ConnID() uint64 {
@@ -34,7 +36,14 @@ func (m HttpContextMock) ConnID() uint64 {
 }
 
 func (HttpContextMock) Error(msg string, statusCode int) {
-	panic("func (HttpContextMock) Error(msg string, statusCode int) should not be called")
+	parsed := &ParsedError{}
+
+	json.NewDecoder(strings.NewReader(msg)).Decode(parsed)
+
+	// then
+	if parsed.Msg != "failed to XREAD" {
+		panic("unexpected msg: " + parsed.Msg)
+	}
 }
 
 func (HttpContextMock) ResetBody() {
@@ -297,6 +306,59 @@ func TestPump(t *testing.T) {
 
 	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", "p:stories:story1", "89012-3").
 		Expect(nil)
+
+	// when
+	ctx.pump(nil, bufio.NewWriter(buf))
+
+	// then
+	if buf.String() != expected {
+		t.Errorf("buf.toString(): %s != %s", buf.String(), expected)
+	}
+}
+
+func TestPumpError(t *testing.T) {
+	t.Parallel()
+
+	// given
+	conn := redigomock.NewConn()
+	buf := new(bytes.Buffer)
+	ctx := StoryReadCtx{
+		RedisConn:      conn,
+		KeyPrefix:      "p:",
+		XReadCount:     2,
+		EntriesToFlush: 7,
+		HttpCtx:        &HttpContextMock{ConnId: 42, Buffer: buf},
+		Story:          "story1",
+	}
+	expected :=
+		`{"type":"event","id":"p:stories:story1-12345-1","payload":{"value": 123}}` +
+			`{"type":"event","id":"p:stories:story1-67890-0","payload":{"value": 124}}`
+
+	// interactions
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", "p:stories:story1", "0").
+		Expect([]interface{}{
+			[]interface{}{
+				"p:stories:story1",
+				[]interface{}{
+					[]interface{}{
+						"12345-1",
+						[]interface{}{
+							"payload",
+							[]byte(`{"value": 123}`),
+						},
+					},
+					[]interface{}{
+						"67890-0",
+						[]interface{}{
+							"payload",
+							[]byte(`{"value": 124}`),
+						},
+					},
+				},
+			},
+		})
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", "p:stories:story1", "67890-0").
+		ExpectError(errors.New("ignored"))
 
 	// when
 	ctx.pump(nil, bufio.NewWriter(buf))
