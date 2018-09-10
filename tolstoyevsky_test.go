@@ -34,7 +34,7 @@ func (m HttpContextMock) ConnID() uint64 {
 }
 
 func (HttpContextMock) Error(msg string, statusCode int) {
-	panic("should not be called")
+	panic("func (HttpContextMock) Error(msg string, statusCode int) should not be called")
 }
 
 func (HttpContextMock) ResetBody() {
@@ -206,7 +206,7 @@ func TestPump(t *testing.T) {
 	// the last entry is not flushed
 
 	// interactions
-	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stories:story1"), "0").
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", "p:stories:story1", "0").
 		Expect([]interface{}{
 			[]interface{}{
 				"p:stories:story1",
@@ -228,7 +228,7 @@ func TestPump(t *testing.T) {
 				},
 			},
 		})
-	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stories:story1"), "67890-0").
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", "p:stories:story1", "67890-0").
 		Expect([]interface{}{
 			[]interface{}{
 				"p:stories:story1",
@@ -239,18 +239,18 @@ func TestPump(t *testing.T) {
 							"payload",
 							[]byte(`{"value": 125}`),
 						},
+					},
+					[]interface{}{
+						"78901-0",
 						[]interface{}{
-							"78901-0",
-							[]interface{}{
-								"payload",
-								[]byte(`{"value": 126}`),
-							},
+							"payload",
+							[]byte(`{"value": 126}`),
 						},
 					},
 				},
 			},
 		})
-	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stories:story1"), "0").
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", "p:stories:story1", "78901-0").
 		Expect([]interface{}{
 			[]interface{}{
 				"p:stories:story1",
@@ -272,7 +272,7 @@ func TestPump(t *testing.T) {
 				},
 			},
 		})
-	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stories:story1"), "89012-1").
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", "p:stories:story1", "89012-1").
 		Expect([]interface{}{
 			[]interface{}{
 				"p:stories:story1",
@@ -294,23 +294,8 @@ func TestPump(t *testing.T) {
 				},
 			},
 		})
-	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stories:story1"), "89012-1").
-		Expect([]interface{}{
-			[]interface{}{
-				"p:stories:story1",
-				[]interface{}{
-					[]interface{}{
-						"89012-4",
-						[]interface{}{
-							"payload",
-							[]byte(`{"value": 129}`),
-						},
-					},
-				},
-			},
-		})
 
-	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", []byte("p:stories:story1"), "89012-4").
+	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", "p:stories:story1", "89012-3").
 		Expect(nil)
 
 	// when
