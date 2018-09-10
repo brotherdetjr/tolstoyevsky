@@ -30,8 +30,6 @@ var args struct {
 
 var logger zerolog.Logger
 
-var semicolon = []byte{';'}
-
 var contexts sync.Map
 
 func main() {
