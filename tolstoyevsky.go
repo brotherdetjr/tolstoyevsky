@@ -30,7 +30,7 @@ var args struct {
 
 var logger zerolog.Logger
 
-var contexts sync.Map
+var contexts CtxRegistryImpl
 
 func main() {
 	parseArgs()
@@ -70,27 +70,31 @@ func handleShutdown(httpServer *fasthttp.Server) {
 	signal.Notify(shutdownCh, syscall.SIGINT)
 	sig := <-shutdownCh
 	logger.Info().Msg("Shutting down")
-	contexts.Range(func(key, value interface{}) bool {
-		ctx := value.(*StoryReadCtx)
-		ctx.writeInfo("Closing connection", "signal", sig.String())
-		ctx.HttpWriter.Flush()
-		ctx.HttpCtx.ResetBody()
-		return true
-	})
 	httpServer.Shutdown()
+	contexts.Close(sig)
 }
 
 func parseArgs() {
-	args.ListenAddr = *flag.String("listenAddr", ":8080", "TCP address to listen to")
-	args.RedisAddr = *flag.String("redisAddr", ":6379", "Redis address:port")
-	args.ReadTimeout = *flag.Duration("readTimeout", 24*time.Hour, "Redis read timeout")
-	args.KeyPrefix = *flag.String("keyPrefix", "tolstoyevsky:", "Redis key prefix to avoid name clashing")
-	args.PrettyLog = *flag.Bool("prettyLog", true, "Outputs the log prettily printed and colored (slower)")
-	args.XReadCount = *flag.Uint("xReadCount", 512, "XREAD COUNT value")
-	args.EntriesToFlush = *flag.Uint64("entriesToFlush", 1, "Entries count to flush the writer after. "+
+	listenAddr := flag.String("listenAddr", ":8080", "TCP address to listen to")
+	redisAddr := flag.String("redisAddr", ":6379", "Redis address:port")
+	readTimeout := flag.Duration("readTimeout", 24*time.Hour, "Redis read timeout")
+	keyPrefix := flag.String("keyPrefix", "tolstoyevsky:", "Redis key prefix to avoid name clashing")
+	prettyLog := flag.Bool("prettyLog", true, "Outputs the log prettily printed and colored (slower)")
+	xReadCount := flag.Uint("xReadCount", 512, "XREAD COUNT value")
+	entriesToFlush := flag.Uint64("entriesToFlush", 1, "Entries count to flush the writer after. "+
 		"If 0, flush policy is determined by buffer capacity")
-	args.Debug = *flag.Bool("debug", false, "Sets log level to debug")
+	debug := flag.Bool("debug", false, "Sets log level to debug")
+
 	flag.Parse()
+
+	args.ListenAddr = *listenAddr
+	args.RedisAddr = *redisAddr
+	args.ReadTimeout = *readTimeout
+	args.KeyPrefix = *keyPrefix
+	args.PrettyLog = *prettyLog
+	args.XReadCount = *xReadCount
+	args.EntriesToFlush = *entriesToFlush
+	args.Debug = *debug
 }
 
 func initLogger() {
@@ -123,6 +127,7 @@ type StoryReadCtx struct {
 	Story          string
 	HttpCtx        HttpContext
 	HttpWriter     *bufio.Writer
+	Registry       CtxRegistry
 }
 
 type Patch struct {
@@ -151,8 +156,9 @@ func readStory(story string, httpCtx *fasthttp.RequestCtx) {
 			HttpCtx:        httpCtx,
 			EntriesToFlush: args.EntriesToFlush,
 			Story:          story,
+			Registry:       &contexts,
 		}
-		contexts.Store(httpCtx.ConnID(), &ctx)
+		ctx.Registry.Register(&ctx)
 		if err == nil {
 			httpCtx.SetBodyStreamWriter(func(writer *bufio.Writer) {
 				ctx.HttpWriter = writer
@@ -160,6 +166,7 @@ func readStory(story string, httpCtx *fasthttp.RequestCtx) {
 			})
 		} else {
 			ctx.writeError(err, "failed to load patches for the story")
+			ctx.Registry.Unregister(&ctx)
 		}
 	} else {
 		ctx := StoryReadCtx{HttpCtx: httpCtx, Story: story}
@@ -272,6 +279,8 @@ func (ctx *StoryReadCtx) pump(patches []Patch, writer *bufio.Writer) {
 		} else if err != nil {
 			ctx.writeError(err, "failed to XREAD", "stream", key)
 			writer.Flush()
+			//noinspection GoDeferInLoop
+			defer ctx.Registry.Unregister(ctx)
 			return
 		} else {
 			break
@@ -286,4 +295,38 @@ func (ctx *StoryReadCtx) logFlush(entriesWritten uint64) {
 		Str("story", ctx.Story).
 		Uint64("entriesToFlush", ctx.EntriesToFlush).
 		Msg("Flushing entries writer buffer")
+}
+
+type CtxRegistry interface {
+	Register(*StoryReadCtx)
+	Unregister(*StoryReadCtx)
+	Close(os.Signal)
+}
+
+type CtxRegistryImpl struct {
+	Map sync.Map
+}
+
+func (reg *CtxRegistryImpl) Register(ctx *StoryReadCtx) {
+	logger.Debug().
+		Uint64("connId", ctx.HttpCtx.ConnID()).
+		Msg("Registering new HTTP connection")
+	reg.Map.Store(ctx.HttpCtx.ConnID(), ctx)
+}
+
+func (reg *CtxRegistryImpl) Unregister(ctx *StoryReadCtx) {
+	logger.Debug().
+		Uint64("connId", ctx.HttpCtx.ConnID()).
+		Msg("Unregistering HTTP connection")
+	reg.Map.Delete(ctx.HttpCtx.ConnID())
+}
+
+func (reg *CtxRegistryImpl) Close(sig os.Signal) {
+	reg.Map.Range(func(key, value interface{}) bool {
+		ctx := value.(*StoryReadCtx)
+		ctx.writeInfo("Closing connection", "signal", sig.String())
+		ctx.HttpWriter.Flush()
+		ctx.HttpCtx.ResetBody()
+		return true
+	})
 }

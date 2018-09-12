@@ -320,6 +320,7 @@ func TestPumpError(t *testing.T) {
 	t.Parallel()
 
 	// given
+	var contexts CtxRegistryImpl
 	conn := redigomock.NewConn()
 	buf := new(bytes.Buffer)
 	ctx := StoryReadCtx{
@@ -329,6 +330,7 @@ func TestPumpError(t *testing.T) {
 		EntriesToFlush: 7,
 		HttpCtx:        &HttpContextMock{ConnId: 42, Buffer: buf},
 		Story:          "story1",
+		Registry:       &contexts,
 	}
 	expected :=
 		`{"type":"event","id":"p:stories:story1-12345-1","payload":{"value": 123}}` +
