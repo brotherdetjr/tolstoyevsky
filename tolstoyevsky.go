@@ -17,7 +17,14 @@ import (
 	"time"
 )
 
-var args struct {
+type Tolstoyevsky struct {
+	Args       Args
+	Logger     *zerolog.Logger
+	Contexts   sync.Map
+	HttpServer *fasthttp.Server
+}
+
+type Args struct {
 	ListenAddr     string
 	RedisAddr      string
 	ReadTimeout    time.Duration
@@ -28,13 +35,7 @@ var args struct {
 	Debug          bool
 }
 
-var logger zerolog.Logger
-
-var contexts CtxRegistryImpl
-
-func main() {
-	parseArgs()
-	initLogger()
+func NewTolstoyevsky(args Args, logger *zerolog.Logger) *Tolstoyevsky {
 
 	logger.Info().
 		Str("listenAddr", args.ListenAddr).
@@ -48,33 +49,37 @@ func main() {
 		Msg("Starting Tolstoyevsky")
 
 	router := fasthttprouter.New()
-	router.GET("/stories/:story", readStoryHandler)
-
 	httpServer := &fasthttp.Server{Handler: router.Handler}
+	var t = Tolstoyevsky{Args: args, Logger: logger, HttpServer: httpServer}
+	router.GET("/stories/:story", t.readStoryHandler())
 
 	go func() {
-		if err := httpServer.ListenAndServe(args.ListenAddr); err != nil {
-			logger.Fatal().
+		if err := httpServer.ListenAndServe(t.Args.ListenAddr); err != nil {
+			t.Logger.Fatal().
 				Err(err).
 				Msg("Error in ListenAndServe")
 		}
 	}()
 
-	handleShutdown(httpServer)
-
+	return &t
 }
 
-func handleShutdown(httpServer *fasthttp.Server) {
+func main() {
+	args := parseArgs()
+	NewTolstoyevsky(args, createLogger(args)).AwaitShutdown().Close()
+}
+
+func (t *Tolstoyevsky) AwaitShutdown() *Tolstoyevsky {
 	var shutdownCh = make(chan os.Signal, 1)
-	signal.Notify(shutdownCh, syscall.SIGTERM)
-	signal.Notify(shutdownCh, syscall.SIGINT)
+	signal.Notify(shutdownCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-shutdownCh
-	logger.Info().Msg("Shutting down")
-	httpServer.Shutdown()
-	contexts.Close(sig)
+	t.Logger.Info().
+		Str("signal", sig.String()).
+		Msg("Shutting down")
+	return t
 }
 
-func parseArgs() {
+func parseArgs() Args {
 	listenAddr := flag.String("listenAddr", ":8080", "TCP address to listen to")
 	redisAddr := flag.String("redisAddr", ":6379", "Redis address:port")
 	readTimeout := flag.Duration("readTimeout", 24*time.Hour, "Redis read timeout")
@@ -87,6 +92,7 @@ func parseArgs() {
 
 	flag.Parse()
 
+	var args Args
 	args.ListenAddr = *listenAddr
 	args.RedisAddr = *redisAddr
 	args.ReadTimeout = *readTimeout
@@ -95,10 +101,11 @@ func parseArgs() {
 	args.XReadCount = *xReadCount
 	args.EntriesToFlush = *entriesToFlush
 	args.Debug = *debug
+	return args
 }
 
-func initLogger() {
-	logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
+func createLogger(args Args) *zerolog.Logger {
+	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
 	if args.PrettyLog {
 		logger = logger.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 	}
@@ -106,10 +113,11 @@ func initLogger() {
 	if args.Debug {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
+	return &logger
 }
 
-func redisConnection() (redis.Conn, error) {
-	return redis.Dial("tcp", args.RedisAddr, redis.DialReadTimeout(args.ReadTimeout))
+func (t *Tolstoyevsky) redisConnection() (redis.Conn, error) {
+	return redis.Dial("tcp", t.Args.RedisAddr, redis.DialReadTimeout(t.Args.ReadTimeout))
 }
 
 type HttpContext interface {
@@ -128,6 +136,7 @@ type StoryReadCtx struct {
 	HttpCtx        HttpContext
 	HttpWriter     *bufio.Writer
 	Registry       CtxRegistry
+	Logger         *zerolog.Logger
 }
 
 type Patch struct {
@@ -136,29 +145,32 @@ type Patch struct {
 	Id           string
 }
 
-func readStoryHandler(ctx *fasthttp.RequestCtx) {
-	story := ctx.UserValue("story").(string)
-	logger.Info().
-		Str("story", story).
-		Str("remoteAddr", ctx.RemoteIP().String()).
-		Uint64("connId", ctx.ConnID()).
-		Msg("Reading story")
-	ctx.SetContentType("application/stream+json; charset=utf8")
-	readStory(story, ctx)
+func (t *Tolstoyevsky) readStoryHandler() func(ctx *fasthttp.RequestCtx) {
+	return func(ctx *fasthttp.RequestCtx) {
+		story := ctx.UserValue("story").(string)
+		t.Logger.Info().
+			Str("story", story).
+			Str("remoteAddr", ctx.RemoteIP().String()).
+			Uint64("connId", ctx.ConnID()).
+			Msg("Reading story")
+		ctx.SetContentType("application/stream+json; charset=utf8")
+		t.readStory(story, ctx)
+	}
 }
 
-func readStory(story string, httpCtx *fasthttp.RequestCtx) {
-	if redisConn, err := redisConnection(); err == nil {
+func (t *Tolstoyevsky) readStory(story string, httpCtx *fasthttp.RequestCtx) {
+	if redisConn, err := t.redisConnection(); err == nil {
 		ctx := StoryReadCtx{
 			RedisConn:      redisConn,
-			KeyPrefix:      args.KeyPrefix,
-			XReadCount:     args.XReadCount,
+			KeyPrefix:      t.Args.KeyPrefix,
+			XReadCount:     t.Args.XReadCount,
 			HttpCtx:        httpCtx,
-			EntriesToFlush: args.EntriesToFlush,
+			EntriesToFlush: t.Args.EntriesToFlush,
 			Story:          story,
-			Registry:       &contexts,
+			Registry:       t,
+			Logger:         t.Logger,
 		}
-		ctx.Registry.Register(&ctx)
+		t.Register(&ctx)
 		if err == nil {
 			httpCtx.SetBodyStreamWriter(func(writer *bufio.Writer) {
 				ctx.HttpWriter = writer
@@ -166,7 +178,7 @@ func readStory(story string, httpCtx *fasthttp.RequestCtx) {
 			})
 		} else {
 			ctx.writeError(err, "failed to load patches for the story")
-			ctx.Registry.Unregister(&ctx)
+			t.Unregister(&ctx)
 		}
 	} else {
 		ctx := StoryReadCtx{HttpCtx: httpCtx, Story: story}
@@ -213,7 +225,7 @@ func writeKeyValues(msg *strings.Builder, log KeyValueWriter, keyValues ...strin
 }
 
 func (ctx *StoryReadCtx) writeInfo(description string, keyValues ...string) {
-	var log = logger.Info().
+	var log = ctx.Logger.Info().
 		Str("story", ctx.Story).
 		Uint64("connId", ctx.HttpCtx.ConnID())
 	var msg strings.Builder
@@ -230,7 +242,7 @@ func (ctx *StoryReadCtx) writeInfo(description string, keyValues ...string) {
 
 func (ctx *StoryReadCtx) writeError(err error, description string, keyValues ...string) {
 	errId := uuid.Must(uuid.NewV4()).String()
-	var log = logger.Error().
+	var log = ctx.Logger.Error().
 		Err(err).
 		Str("story", ctx.Story).
 		Uint64("connId", ctx.HttpCtx.ConnID()).
@@ -279,8 +291,8 @@ func (ctx *StoryReadCtx) pump(patches []Patch, writer *bufio.Writer) {
 		} else if err != nil {
 			ctx.writeError(err, "failed to XREAD", "stream", key)
 			writer.Flush()
-			//noinspection GoDeferInLoop
-			defer ctx.Registry.Unregister(ctx)
+			ctx.HttpCtx.ResetBody()
+			ctx.Registry.Unregister(ctx)
 			return
 		} else {
 			break
@@ -289,7 +301,7 @@ func (ctx *StoryReadCtx) pump(patches []Patch, writer *bufio.Writer) {
 }
 
 func (ctx *StoryReadCtx) logFlush(entriesWritten uint64) {
-	logger.Debug().
+	ctx.Logger.Debug().
 		Uint64("entriesWritten", entriesWritten).
 		Uint64("connId", ctx.HttpCtx.ConnID()).
 		Str("story", ctx.Story).
@@ -300,33 +312,30 @@ func (ctx *StoryReadCtx) logFlush(entriesWritten uint64) {
 type CtxRegistry interface {
 	Register(*StoryReadCtx)
 	Unregister(*StoryReadCtx)
-	Close(os.Signal)
 }
 
-type CtxRegistryImpl struct {
-	Map sync.Map
-}
-
-func (reg *CtxRegistryImpl) Register(ctx *StoryReadCtx) {
-	logger.Debug().
+func (t *Tolstoyevsky) Register(ctx *StoryReadCtx) {
+	t.Logger.Debug().
 		Uint64("connId", ctx.HttpCtx.ConnID()).
 		Msg("Registering new HTTP connection")
-	reg.Map.Store(ctx.HttpCtx.ConnID(), ctx)
+	t.Contexts.Store(ctx.HttpCtx.ConnID(), ctx)
 }
 
-func (reg *CtxRegistryImpl) Unregister(ctx *StoryReadCtx) {
-	logger.Debug().
+func (t *Tolstoyevsky) Unregister(ctx *StoryReadCtx) {
+	t.Logger.Debug().
 		Uint64("connId", ctx.HttpCtx.ConnID()).
 		Msg("Unregistering HTTP connection")
-	reg.Map.Delete(ctx.HttpCtx.ConnID())
+	t.Contexts.Delete(ctx.HttpCtx.ConnID())
 }
 
-func (reg *CtxRegistryImpl) Close(sig os.Signal) {
-	reg.Map.Range(func(key, value interface{}) bool {
+func (t *Tolstoyevsky) Close() error {
+	err := t.HttpServer.Shutdown()
+	t.Contexts.Range(func(key, value interface{}) bool {
 		ctx := value.(*StoryReadCtx)
-		ctx.writeInfo("Closing connection", "signal", sig.String())
+		ctx.writeInfo("Closing connection")
 		ctx.HttpWriter.Flush()
 		ctx.HttpCtx.ResetBody()
 		return true
 	})
+	return err
 }
