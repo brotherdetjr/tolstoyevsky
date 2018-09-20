@@ -1,4 +1,4 @@
-package main
+package tolstoyevsky
 
 import (
 	"bufio"
@@ -7,11 +7,15 @@ import (
 	"errors"
 	"github.com/google/go-cmp/cmp"
 	"github.com/rafaeljusto/redigomock"
+	"github.com/rs/zerolog"
 	"github.com/satori/go.uuid"
 	"github.com/valyala/fasthttp"
 	"strings"
+	"sync"
 	"testing"
 )
+
+var logger = zerolog.Nop()
 
 type ParsedError struct {
 	Type  string `json:"type"`
@@ -130,10 +134,11 @@ func TestWriteInfo(t *testing.T) {
 
 	// given
 	buf := new(bytes.Buffer)
-	ctx := StoryReadCtx{
+	ctx := storyReadCtx{
 		Story:      "myStory",
 		HttpCtx:    &HttpContextMock{ConnId: 42},
 		HttpWriter: bufio.NewWriter(buf),
+		Logger:     &logger,
 	}
 	expected := `{"type":"info","msg":"Some description","key1":"value1","key2":"value2"}`
 
@@ -153,10 +158,11 @@ func TestWriteError(t *testing.T) {
 
 	// given
 	buf := new(bytes.Buffer)
-	ctx := StoryReadCtx{
+	ctx := storyReadCtx{
 		Story:      "myStory",
 		HttpCtx:    &HttpContextMock{ConnId: 42},
 		HttpWriter: bufio.NewWriter(buf),
+		Logger:     &logger,
 	}
 	parsed := &ParsedError{}
 
@@ -195,13 +201,14 @@ func TestPump(t *testing.T) {
 
 	// given
 	conn := redigomock.NewConn()
-	ctx := StoryReadCtx{
+	ctx := storyReadCtx{
 		RedisConn:      conn,
 		KeyPrefix:      "p:",
 		XReadCount:     2,
 		EntriesToFlush: 7,
 		HttpCtx:        &HttpContextMock{ConnId: 42},
 		Story:          "story1",
+		Logger:         &logger,
 	}
 	buf := new(bytes.Buffer)
 	expected :=
@@ -308,7 +315,7 @@ func TestPump(t *testing.T) {
 		Expect(nil)
 
 	// when
-	ctx.pump(nil, bufio.NewWriter(buf))
+	ctx.pump(bufio.NewWriter(buf))
 
 	// then
 	if buf.String() != expected {
@@ -320,17 +327,18 @@ func TestPumpError(t *testing.T) {
 	t.Parallel()
 
 	// given
-	var contexts CtxRegistryImpl
 	conn := redigomock.NewConn()
 	buf := new(bytes.Buffer)
-	ctx := StoryReadCtx{
+	var contexts sync.Map
+	ctx := storyReadCtx{
 		RedisConn:      conn,
 		KeyPrefix:      "p:",
 		XReadCount:     2,
 		EntriesToFlush: 7,
 		HttpCtx:        &HttpContextMock{ConnId: 42, Buffer: buf},
 		Story:          "story1",
-		Registry:       &contexts,
+		Logger:         &logger,
+		Contexts:       &contexts,
 	}
 	expected :=
 		`{"type":"event","id":"p:stories:story1-12345-1","payload":{"value": 123}}` +
@@ -363,7 +371,7 @@ func TestPumpError(t *testing.T) {
 		ExpectError(errors.New("ignored"))
 
 	// when
-	ctx.pump(nil, bufio.NewWriter(buf))
+	ctx.pump(bufio.NewWriter(buf))
 
 	// then
 	if buf.String() != expected {

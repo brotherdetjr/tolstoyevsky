@@ -1,8 +1,7 @@
-package main
+package tolstoyevsky
 
 import (
 	"bufio"
-	"flag"
 	"github.com/buaazp/fasthttprouter"
 	"github.com/gomodule/redigo/redis"
 	"github.com/rs/zerolog"
@@ -16,6 +15,7 @@ import (
 	"syscall"
 	"time"
 )
+
 
 type Tolstoyevsky struct {
 	Args       Args
@@ -35,7 +35,7 @@ type Args struct {
 	Debug          bool
 }
 
-func NewTolstoyevsky(args Args, logger *zerolog.Logger) *Tolstoyevsky {
+func New(args Args, logger *zerolog.Logger) *Tolstoyevsky {
 
 	logger.Info().
 		Str("listenAddr", args.ListenAddr).
@@ -55,18 +55,13 @@ func NewTolstoyevsky(args Args, logger *zerolog.Logger) *Tolstoyevsky {
 
 	go func() {
 		if err := httpServer.ListenAndServe(t.Args.ListenAddr); err != nil {
-			t.Logger.Fatal().
+			t.Logger.Panic().
 				Err(err).
 				Msg("Error in ListenAndServe")
 		}
 	}()
 
 	return &t
-}
-
-func main() {
-	args := parseArgs()
-	NewTolstoyevsky(args, createLogger(args)).AwaitShutdown().Close()
 }
 
 func (t *Tolstoyevsky) AwaitShutdown() *Tolstoyevsky {
@@ -79,70 +74,41 @@ func (t *Tolstoyevsky) AwaitShutdown() *Tolstoyevsky {
 	return t
 }
 
-func parseArgs() Args {
-	listenAddr := flag.String("listenAddr", ":8080", "TCP address to listen to")
-	redisAddr := flag.String("redisAddr", ":6379", "Redis address:port")
-	readTimeout := flag.Duration("readTimeout", 24*time.Hour, "Redis read timeout")
-	keyPrefix := flag.String("keyPrefix", "tolstoyevsky:", "Redis key prefix to avoid name clashing")
-	prettyLog := flag.Bool("prettyLog", true, "Outputs the log prettily printed and colored (slower)")
-	xReadCount := flag.Uint("xReadCount", 512, "XREAD COUNT value")
-	entriesToFlush := flag.Uint64("entriesToFlush", 1, "Entries count to flush the writer after. "+
-		"If 0, flush policy is determined by buffer capacity")
-	debug := flag.Bool("debug", false, "Sets log level to debug")
-
-	flag.Parse()
-
-	var args Args
-	args.ListenAddr = *listenAddr
-	args.RedisAddr = *redisAddr
-	args.ReadTimeout = *readTimeout
-	args.KeyPrefix = *keyPrefix
-	args.PrettyLog = *prettyLog
-	args.XReadCount = *xReadCount
-	args.EntriesToFlush = *entriesToFlush
-	args.Debug = *debug
-	return args
+func (t *Tolstoyevsky) Close() error {
+	err := t.HttpServer.Shutdown()
+	t.Contexts.Range(func(key, value interface{}) bool {
+		ctx := value.(*storyReadCtx)
+		ctx.writeInfo("Closing connection")
+		ctx.HttpWriter.Flush()
+		ctx.HttpCtx.ResetBody()
+		return true
+	})
+	return err
 }
 
-func createLogger(args Args) *zerolog.Logger {
-	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
-	if args.PrettyLog {
-		logger = logger.Output(zerolog.ConsoleWriter{Out: os.Stderr})
-	}
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	if args.Debug {
-		zerolog.SetGlobalLevel(zerolog.DebugLevel)
-	}
-	return &logger
-}
+// private
 
-func (t *Tolstoyevsky) redisConnection() (redis.Conn, error) {
-	return redis.Dial("tcp", t.Args.RedisAddr, redis.DialReadTimeout(t.Args.ReadTimeout))
-}
-
-type HttpContext interface {
+type httpContext interface {
 	SetBodyStreamWriter(sw fasthttp.StreamWriter)
 	ConnID() uint64
 	Error(msg string, statusCode int)
 	ResetBody()
 }
 
-type StoryReadCtx struct {
+type storyReadCtx struct {
 	RedisConn      redis.Conn
 	KeyPrefix      string
 	XReadCount     uint
 	EntriesToFlush uint64
 	Story          string
-	HttpCtx        HttpContext
+	HttpCtx        httpContext
 	HttpWriter     *bufio.Writer
-	Registry       CtxRegistry
+	Contexts       *sync.Map
 	Logger         *zerolog.Logger
 }
 
-type Patch struct {
-	FirstEntryId string
-	LastEntryId  string
-	Id           string
+func (t *Tolstoyevsky) redisConnection() (redis.Conn, error) {
+	return redis.Dial("tcp", t.Args.RedisAddr, redis.DialReadTimeout(t.Args.ReadTimeout))
 }
 
 func (t *Tolstoyevsky) readStoryHandler() func(ctx *fasthttp.RequestCtx) {
@@ -160,28 +126,26 @@ func (t *Tolstoyevsky) readStoryHandler() func(ctx *fasthttp.RequestCtx) {
 
 func (t *Tolstoyevsky) readStory(story string, httpCtx *fasthttp.RequestCtx) {
 	if redisConn, err := t.redisConnection(); err == nil {
-		ctx := StoryReadCtx{
+		ctx := storyReadCtx{
 			RedisConn:      redisConn,
 			KeyPrefix:      t.Args.KeyPrefix,
 			XReadCount:     t.Args.XReadCount,
 			HttpCtx:        httpCtx,
 			EntriesToFlush: t.Args.EntriesToFlush,
 			Story:          story,
-			Registry:       t,
+			Contexts:       &(t.Contexts),
 			Logger:         t.Logger,
 		}
-		t.Register(&ctx)
-		if err == nil {
-			httpCtx.SetBodyStreamWriter(func(writer *bufio.Writer) {
-				ctx.HttpWriter = writer
-				ctx.pump([]Patch{}, writer)
-			})
-		} else {
-			ctx.writeError(err, "failed to load patches for the story")
-			t.Unregister(&ctx)
-		}
+		t.Logger.Debug().
+			Uint64("connId", ctx.HttpCtx.ConnID()).
+			Msg("Registering new HTTP connection")
+		t.Contexts.Store(ctx.HttpCtx.ConnID(), ctx)
+		httpCtx.SetBodyStreamWriter(func(writer *bufio.Writer) {
+			ctx.HttpWriter = writer
+			ctx.pump(writer)
+		})
 	} else {
-		ctx := StoryReadCtx{HttpCtx: httpCtx, Story: story}
+		ctx := storyReadCtx{HttpCtx: httpCtx, Story: story}
 		ctx.writeError(err, "failed to create connection to Redis")
 	}
 }
@@ -204,11 +168,7 @@ func writeEntry(entry interface{}, writer *bufio.Writer, key string) {
 	writer.WriteString("}")
 }
 
-type KeyValueWriter interface {
-	Str(k, v string) *zerolog.Event
-}
-
-func writeKeyValues(msg *strings.Builder, log KeyValueWriter, keyValues ...string) {
+func writeKeyValues(msg *strings.Builder, log *zerolog.Event, keyValues ...string) {
 	var k string
 	for i, kv := range keyValues {
 		if i%2 == 0 {
@@ -224,7 +184,7 @@ func writeKeyValues(msg *strings.Builder, log KeyValueWriter, keyValues ...strin
 	}
 }
 
-func (ctx *StoryReadCtx) writeInfo(description string, keyValues ...string) {
+func (ctx *storyReadCtx) writeInfo(description string, keyValues ...string) {
 	var log = ctx.Logger.Info().
 		Str("story", ctx.Story).
 		Uint64("connId", ctx.HttpCtx.ConnID())
@@ -240,7 +200,7 @@ func (ctx *StoryReadCtx) writeInfo(description string, keyValues ...string) {
 	}
 }
 
-func (ctx *StoryReadCtx) writeError(err error, description string, keyValues ...string) {
+func (ctx *storyReadCtx) writeError(err error, description string, keyValues ...string) {
 	errId := uuid.Must(uuid.NewV4()).String()
 	var log = ctx.Logger.Error().
 		Err(err).
@@ -265,7 +225,7 @@ func (ctx *StoryReadCtx) writeError(err error, description string, keyValues ...
 	}
 }
 
-func (ctx *StoryReadCtx) pump(patches []Patch, writer *bufio.Writer) {
+func (ctx *storyReadCtx) pump(writer *bufio.Writer) {
 	var entriesWritten uint64 = 0
 	key := ctx.KeyPrefix + "stories:" + ctx.Story
 	firstId := "0"
@@ -281,7 +241,12 @@ func (ctx *StoryReadCtx) pump(patches []Patch, writer *bufio.Writer) {
 				if ctx.EntriesToFlush != 0 {
 					entriesWritten++
 					if entriesWritten%ctx.EntriesToFlush == 0 {
-						ctx.logFlush(entriesWritten)
+						ctx.Logger.Debug().
+							Uint64("entriesWritten", entriesWritten).
+							Uint64("connId", ctx.HttpCtx.ConnID()).
+							Str("story", ctx.Story).
+							Uint64("entriesToFlush", ctx.EntriesToFlush).
+							Msg("Flushing entries writer buffer")
 						// TODO how does oboe.js treat trimmed json, when buffer is filled and flushed?
 						writer.Flush()
 					}
@@ -292,50 +257,13 @@ func (ctx *StoryReadCtx) pump(patches []Patch, writer *bufio.Writer) {
 			ctx.writeError(err, "failed to XREAD", "stream", key)
 			writer.Flush()
 			ctx.HttpCtx.ResetBody()
-			ctx.Registry.Unregister(ctx)
+			ctx.Logger.Debug().
+				Uint64("connId", ctx.HttpCtx.ConnID()).
+				Msg("Unregistering HTTP connection")
+			ctx.Contexts.Delete(ctx.HttpCtx.ConnID())
 			return
 		} else {
 			break
 		}
 	}
-}
-
-func (ctx *StoryReadCtx) logFlush(entriesWritten uint64) {
-	ctx.Logger.Debug().
-		Uint64("entriesWritten", entriesWritten).
-		Uint64("connId", ctx.HttpCtx.ConnID()).
-		Str("story", ctx.Story).
-		Uint64("entriesToFlush", ctx.EntriesToFlush).
-		Msg("Flushing entries writer buffer")
-}
-
-type CtxRegistry interface {
-	Register(*StoryReadCtx)
-	Unregister(*StoryReadCtx)
-}
-
-func (t *Tolstoyevsky) Register(ctx *StoryReadCtx) {
-	t.Logger.Debug().
-		Uint64("connId", ctx.HttpCtx.ConnID()).
-		Msg("Registering new HTTP connection")
-	t.Contexts.Store(ctx.HttpCtx.ConnID(), ctx)
-}
-
-func (t *Tolstoyevsky) Unregister(ctx *StoryReadCtx) {
-	t.Logger.Debug().
-		Uint64("connId", ctx.HttpCtx.ConnID()).
-		Msg("Unregistering HTTP connection")
-	t.Contexts.Delete(ctx.HttpCtx.ConnID())
-}
-
-func (t *Tolstoyevsky) Close() error {
-	err := t.HttpServer.Shutdown()
-	t.Contexts.Range(func(key, value interface{}) bool {
-		ctx := value.(*StoryReadCtx)
-		ctx.writeInfo("Closing connection")
-		ctx.HttpWriter.Flush()
-		ctx.HttpCtx.ResetBody()
-		return true
-	})
-	return err
 }
