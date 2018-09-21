@@ -75,15 +75,16 @@ func (t *Tolstoyevsky) AwaitShutdown() *Tolstoyevsky {
 }
 
 func (t *Tolstoyevsky) Close() error {
-	err := t.HttpServer.Shutdown()
 	t.Contexts.Range(func(key, value interface{}) bool {
 		ctx := value.(*storyReadCtx)
-		ctx.writeInfo("Closing connection")
-		ctx.HttpWriter.Flush()
+		ctx.writeShutdown()
+		if ctx.HttpWriter != nil {
+			ctx.HttpWriter.Flush()
+		}
 		ctx.HttpCtx.ResetBody()
 		return true
 	})
-	return err
+	return t.HttpServer.Shutdown()
 }
 
 // private
@@ -119,7 +120,8 @@ func (t *Tolstoyevsky) readStoryHandler() func(ctx *fasthttp.RequestCtx) {
 			Str("remoteAddr", ctx.RemoteIP().String()).
 			Uint64("connId", ctx.ConnID()).
 			Msg("Reading story")
-		ctx.SetContentType("application/stream+json; charset=utf8")
+		ctx.SetContentType("text/event-stream; charset=utf8")
+		ctx.Response.Header.Set("Cache-Control", "no-cache")
 		t.readStory(story, ctx)
 	}
 }
@@ -139,13 +141,13 @@ func (t *Tolstoyevsky) readStory(story string, httpCtx *fasthttp.RequestCtx) {
 		t.Logger.Debug().
 			Uint64("connId", ctx.HttpCtx.ConnID()).
 			Msg("Registering new HTTP connection")
-		t.Contexts.Store(ctx.HttpCtx.ConnID(), ctx)
+		t.Contexts.Store(ctx.HttpCtx.ConnID(), &ctx)
 		httpCtx.SetBodyStreamWriter(func(writer *bufio.Writer) {
 			ctx.HttpWriter = writer
 			ctx.pump(writer)
 		})
 	} else {
-		ctx := storyReadCtx{HttpCtx: httpCtx, Story: story}
+		ctx := storyReadCtx{HttpCtx: httpCtx, Story: story, Logger: t.Logger}
 		ctx.writeError(err, "failed to create connection to Redis")
 	}
 }
@@ -156,16 +158,6 @@ func toEntries(result interface{}) []interface{} {
 
 func lastIdInBatch(batch []interface{}) string {
 	return batch[len(batch)-1].([]interface{})[0].(string)
-}
-
-func writeEntry(entry interface{}, writer *bufio.Writer, key string) {
-	writer.WriteString(`{"type":"event","id":"`)
-	writer.WriteString(key)
-	writer.WriteString("-")
-	writer.WriteString(entry.([]interface{})[0].(string))
-	writer.WriteString(`","payload":`)
-	writer.Write(entry.([]interface{})[1].([]interface{})[1].([]byte))
-	writer.WriteString("}")
 }
 
 func writeKeyValues(msg *strings.Builder, log *zerolog.Event, keyValues ...string) {
@@ -184,17 +176,16 @@ func writeKeyValues(msg *strings.Builder, log *zerolog.Event, keyValues ...strin
 	}
 }
 
-func (ctx *storyReadCtx) writeInfo(description string, keyValues ...string) {
+func (ctx *storyReadCtx) writeShutdown() {
 	var log = ctx.Logger.Info().
 		Str("story", ctx.Story).
 		Uint64("connId", ctx.HttpCtx.ConnID())
 	var msg strings.Builder
-	msg.WriteString(`{"type":"info","msg":"`)
-	msg.WriteString(description)
-	msg.WriteByte('"')
-	writeKeyValues(&msg, log, keyValues...)
-	msg.WriteByte('}')
-	log.Msg(description)
+	msgId := uuid.Must(uuid.NewV4()).String()
+	msg.WriteString("id: ")
+	msg.WriteString(msgId)
+	msg.WriteString("\nevent: shutdown\ndata: 0\n\n")
+	log.Msg("Server shutting down. Closing connection")
 	if ctx.HttpWriter != nil {
 		ctx.HttpWriter.WriteString(msg.String())
 	}
@@ -208,21 +199,36 @@ func (ctx *storyReadCtx) writeError(err error, description string, keyValues ...
 		Uint64("connId", ctx.HttpCtx.ConnID()).
 		Str("errId", errId)
 	var msg strings.Builder
-	msg.WriteString(`{"type":"error","msg":"`)
+	msg.WriteString("id: ")
+	msg.WriteString(errId)
+	msg.WriteString("\nevent: ")
+	msg.WriteString("error")
+	msg.WriteByte('\n')
+	msg.WriteString(`data: {"description":"`)
 	msg.WriteString(description)
 	msg.WriteString(`","cause":`)
 	msg.WriteString(strconv.Quote(err.Error()))
-	msg.WriteString(`,"id":"`)
-	msg.WriteString(errId)
-	msg.WriteByte('"')
 	writeKeyValues(&msg, log, keyValues...)
-	msg.WriteByte('}')
+	msg.WriteString("}\n\n")
 	log.Msg(description)
 	if ctx.HttpWriter != nil {
 		ctx.HttpWriter.WriteString(msg.String())
 	} else {
 		ctx.HttpCtx.Error(msg.String(), 500)
 	}
+}
+
+func writeEntry(entry interface{}, writer *bufio.Writer, key string) {
+	writer.WriteString("id: ")
+	writer.WriteString(key)
+	writer.WriteString("-")
+	writer.WriteString(entry.([]interface{})[0].(string))
+	writer.WriteString("\nevent: ")
+	writer.WriteString("entry")
+	writer.WriteString("\ndata: ")
+	writer.Write(entry.([]interface{})[1].([]interface{})[1].([]byte))
+	writer.WriteByte('\n')
+	writer.WriteByte('\n')
 }
 
 func (ctx *storyReadCtx) pump(writer *bufio.Writer) {
@@ -247,7 +253,7 @@ func (ctx *storyReadCtx) pump(writer *bufio.Writer) {
 							Str("story", ctx.Story).
 							Uint64("entriesToFlush", ctx.EntriesToFlush).
 							Msg("Flushing entries writer buffer")
-						// TODO how does oboe.js treat trimmed json, when buffer is filled and flushed?
+						// TODO how does EventSource treat trimmed event, when buffer is filled and flushed?
 						writer.Flush()
 					}
 				}

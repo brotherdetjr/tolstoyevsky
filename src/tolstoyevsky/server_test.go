@@ -143,7 +143,7 @@ func TestWriteInfo(t *testing.T) {
 	expected := `{"type":"info","msg":"Some description","key1":"value1","key2":"value2"}`
 
 	// when
-	ctx.writeInfo("Some description", "key1", "value1", "key2", "value2")
+	ctx.writeShutdown()
 	ctx.HttpWriter.Flush()
 
 	// then
