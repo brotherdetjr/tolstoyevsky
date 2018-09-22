@@ -3,54 +3,49 @@ package tolstoyevsky
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/google/go-cmp/cmp"
 	"github.com/rafaeljusto/redigomock"
 	"github.com/rs/zerolog"
-	"github.com/satori/go.uuid"
 	"github.com/valyala/fasthttp"
-	"strings"
 	"sync"
 	"testing"
 )
 
 var logger = zerolog.Nop()
 
-type ParsedError struct {
-	Type  string `json:"type"`
-	Msg   string `json:"msg"`
-	Cause string `json:"cause"`
-	Id    string `json:"id"`
-	Key1  string `json:"key1"`
-	Key2  string `json:"key2"`
+type httpContextMock struct {
+	connId uint64
+	buffer *bytes.Buffer
 }
 
-type HttpContextMock struct {
-	ConnId uint64
-	Buffer *bytes.Buffer
-}
-
-func (HttpContextMock) SetBodyStreamWriter(sw fasthttp.StreamWriter) {
+func (httpContextMock) SetBodyStreamWriter(sw fasthttp.StreamWriter) {
 	panic("func (HttpContextMock) SetBodyStreamWriter(sw fasthttp.StreamWriter) should not be called")
 }
 
-func (m HttpContextMock) ConnID() uint64 {
-	return m.ConnId
+func (m httpContextMock) ConnID() uint64 {
+	return m.connId
 }
 
-func (HttpContextMock) Error(msg string, statusCode int) {
-	parsed := &ParsedError{}
+func (httpContextMock) Error(msg string, statusCode int) {
+	expected := `id: 999
+event: error
+data: {"description":"Failed to XREAD","cause":"ignored","stream":"p:stories:story1"}
 
-	json.NewDecoder(strings.NewReader(msg)).Decode(parsed)
+`
 
 	// then
-	if parsed.Msg != "failed to XREAD" {
-		panic("unexpected msg: " + parsed.Msg)
+	if msg != expected {
+		panic("unexpected msg: " + msg)
+	}
+
+	if statusCode != 500 {
+		panic(fmt.Sprintf("unexpected statusCode: %d", statusCode))
 	}
 }
 
-func (HttpContextMock) ResetBody() {
+func (httpContextMock) ResetBody() {
 	// nothing
 }
 
@@ -129,22 +124,27 @@ func TestLastIdInBatchSingleEntry(t *testing.T) {
 	}
 }
 
-func TestWriteInfo(t *testing.T) {
+func TestWriteShutdown(t *testing.T) {
 	t.Parallel()
 
 	// given
 	buf := new(bytes.Buffer)
 	ctx := storyReadCtx{
-		Story:      "myStory",
-		HttpCtx:    &HttpContextMock{ConnId: 42},
-		HttpWriter: bufio.NewWriter(buf),
-		Logger:     &logger,
+		story:        "myStory",
+		httpCtx:      &httpContextMock{connId: 42},
+		httpWriter:   bufio.NewWriter(buf),
+		logger:       &logger,
+		uuidSupplier: func() string { return "999" },
 	}
-	expected := `{"type":"info","msg":"Some description","key1":"value1","key2":"value2"}`
+	expected := `id: 999
+event: shutdown
+data: 0
+
+`
 
 	// when
 	ctx.writeShutdown()
-	ctx.HttpWriter.Flush()
+	ctx.httpWriter.Flush()
 
 	// then
 	if buf.String() != expected {
@@ -159,12 +159,17 @@ func TestWriteError(t *testing.T) {
 	// given
 	buf := new(bytes.Buffer)
 	ctx := storyReadCtx{
-		Story:      "myStory",
-		HttpCtx:    &HttpContextMock{ConnId: 42},
-		HttpWriter: bufio.NewWriter(buf),
-		Logger:     &logger,
+		story:        "myStory",
+		httpCtx:      &httpContextMock{connId: 42},
+		httpWriter:   bufio.NewWriter(buf),
+		logger:       &logger,
+		uuidSupplier: func() string { return "999" },
 	}
-	parsed := &ParsedError{}
+	expected := `id: 999
+event: error
+data: {"description":"Some description","cause":"some error","key1":"value1","key2":"value2"}
+
+`
 
 	// when
 	ctx.writeError(
@@ -172,27 +177,11 @@ func TestWriteError(t *testing.T) {
 		"Some description",
 		"key1", "value1", "key2", "value2",
 	)
-	ctx.HttpWriter.Flush()
-	json.NewDecoder(buf).Decode(parsed)
+	ctx.httpWriter.Flush()
 
 	// then
-	if parsed.Type != "error" {
-		t.Errorf("type: %s != error", parsed.Type)
-	}
-	if parsed.Msg != "Some description" {
-		t.Errorf("msg: %s != Some description", parsed.Msg)
-	}
-	if parsed.Cause != "some error" {
-		t.Errorf("cause: %s != some error", parsed.Cause)
-	}
-	if _, err := uuid.FromString(parsed.Id); err != nil {
-		t.Errorf("id: %s is not valid UUID", parsed.Id)
-	}
-	if parsed.Key1 != "value1" {
-		t.Errorf("key1: %s != value1", parsed.Key1)
-	}
-	if parsed.Key2 != "value2" {
-		t.Errorf("key2: %s != value2", parsed.Key2)
+	if buf.String() != expected {
+		t.Errorf("buf.toString(): %s != %s", buf.String(), expected)
 	}
 }
 
@@ -202,23 +191,44 @@ func TestPump(t *testing.T) {
 	// given
 	conn := redigomock.NewConn()
 	ctx := storyReadCtx{
-		RedisConn:      conn,
-		KeyPrefix:      "p:",
-		XReadCount:     2,
-		EntriesToFlush: 7,
-		HttpCtx:        &HttpContextMock{ConnId: 42},
-		Story:          "story1",
-		Logger:         &logger,
+		redisConn:      conn,
+		keyPrefix:      "p:",
+		xReadCount:     2,
+		entriesToFlush: 7,
+		httpCtx:        &httpContextMock{connId: 42},
+		story:          "story1",
+		logger:         &logger,
 	}
 	buf := new(bytes.Buffer)
-	expected :=
-		`{"type":"event","id":"p:stories:story1-12345-1","payload":{"value": 123}}` +
-			`{"type":"event","id":"p:stories:story1-67890-0","payload":{"value": 124}}` +
-			`{"type":"event","id":"p:stories:story1-67890-1","payload":{"value": 125}}` +
-			`{"type":"event","id":"p:stories:story1-78901-0","payload":{"value": 126}}` +
-			`{"type":"event","id":"p:stories:story1-89012-0","payload":{"value": 127}}` +
-			`{"type":"event","id":"p:stories:story1-89012-1","payload":{"value": 128}}` +
-			`{"type":"event","id":"p:stories:story1-89012-2","payload":{"value": 129}}`
+	expected := `id: p:stories:story1-12345-1
+event: entry
+data: {"value": 123}
+
+id: p:stories:story1-67890-0
+event: entry
+data: {"value": 124}
+
+id: p:stories:story1-67890-1
+event: entry
+data: {"value": 125}
+
+id: p:stories:story1-78901-0
+event: entry
+data: {"value": 126}
+
+id: p:stories:story1-89012-0
+event: entry
+data: {"value": 127}
+
+id: p:stories:story1-89012-1
+event: entry
+data: {"value": 128}
+
+id: p:stories:story1-89012-2
+event: entry
+data: {"value": 129}
+
+`
 	// the last entry is not flushed
 
 	// interactions
@@ -331,19 +341,25 @@ func TestPumpError(t *testing.T) {
 	buf := new(bytes.Buffer)
 	var contexts sync.Map
 	ctx := storyReadCtx{
-		RedisConn:      conn,
-		KeyPrefix:      "p:",
-		XReadCount:     2,
-		EntriesToFlush: 7,
-		HttpCtx:        &HttpContextMock{ConnId: 42, Buffer: buf},
-		Story:          "story1",
-		Logger:         &logger,
-		Contexts:       &contexts,
+		redisConn:      conn,
+		keyPrefix:      "p:",
+		xReadCount:     2,
+		entriesToFlush: 7,
+		httpCtx:        &httpContextMock{connId: 42, buffer: buf},
+		story:          "story1",
+		logger:         &logger,
+		contexts:       &contexts,
+		uuidSupplier:   func() string { return "999" },
 	}
-	expected :=
-		`{"type":"event","id":"p:stories:story1-12345-1","payload":{"value": 123}}` +
-			`{"type":"event","id":"p:stories:story1-67890-0","payload":{"value": 124}}`
+	expected := `id: p:stories:story1-12345-1
+event: entry
+data: {"value": 123}
 
+id: p:stories:story1-67890-0
+event: entry
+data: {"value": 124}
+
+`
 	// interactions
 	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", "p:stories:story1", "0").
 		Expect([]interface{}{

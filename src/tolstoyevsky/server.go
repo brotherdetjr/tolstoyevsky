@@ -16,7 +16,6 @@ import (
 	"time"
 )
 
-
 type Tolstoyevsky struct {
 	Args       Args
 	Logger     *zerolog.Logger
@@ -78,13 +77,20 @@ func (t *Tolstoyevsky) Close() error {
 	t.Contexts.Range(func(key, value interface{}) bool {
 		ctx := value.(*storyReadCtx)
 		ctx.writeShutdown()
-		if ctx.HttpWriter != nil {
-			ctx.HttpWriter.Flush()
+		if ctx.httpWriter != nil {
+			ctx.httpWriter.Flush()
 		}
-		ctx.HttpCtx.ResetBody()
+		ctx.httpCtx.ResetBody()
 		return true
 	})
 	return t.HttpServer.Shutdown()
+}
+
+// Default implementation of UUID supplier function.
+// Other implementations might be used in tests to
+// have predictable UUID values.
+func UuidSupplier() string {
+	return uuid.Must(uuid.NewV4()).String()
 }
 
 // private
@@ -97,15 +103,16 @@ type httpContext interface {
 }
 
 type storyReadCtx struct {
-	RedisConn      redis.Conn
-	KeyPrefix      string
-	XReadCount     uint
-	EntriesToFlush uint64
-	Story          string
-	HttpCtx        httpContext
-	HttpWriter     *bufio.Writer
-	Contexts       *sync.Map
-	Logger         *zerolog.Logger
+	redisConn      redis.Conn
+	keyPrefix      string
+	xReadCount     uint
+	entriesToFlush uint64
+	story          string
+	httpCtx        httpContext
+	httpWriter     *bufio.Writer
+	contexts       *sync.Map
+	logger         *zerolog.Logger
+	uuidSupplier   func() string
 }
 
 func (t *Tolstoyevsky) redisConnection() (redis.Conn, error) {
@@ -129,26 +136,27 @@ func (t *Tolstoyevsky) readStoryHandler() func(ctx *fasthttp.RequestCtx) {
 func (t *Tolstoyevsky) readStory(story string, httpCtx *fasthttp.RequestCtx) {
 	if redisConn, err := t.redisConnection(); err == nil {
 		ctx := storyReadCtx{
-			RedisConn:      redisConn,
-			KeyPrefix:      t.Args.KeyPrefix,
-			XReadCount:     t.Args.XReadCount,
-			HttpCtx:        httpCtx,
-			EntriesToFlush: t.Args.EntriesToFlush,
-			Story:          story,
-			Contexts:       &(t.Contexts),
-			Logger:         t.Logger,
+			redisConn:      redisConn,
+			keyPrefix:      t.Args.KeyPrefix,
+			xReadCount:     t.Args.XReadCount,
+			httpCtx:        httpCtx,
+			entriesToFlush: t.Args.EntriesToFlush,
+			story:          story,
+			contexts:       &(t.Contexts),
+			logger:         t.Logger,
+			uuidSupplier:   UuidSupplier,
 		}
 		t.Logger.Debug().
-			Uint64("connId", ctx.HttpCtx.ConnID()).
+			Uint64("connId", ctx.httpCtx.ConnID()).
 			Msg("Registering new HTTP connection")
-		t.Contexts.Store(ctx.HttpCtx.ConnID(), &ctx)
+		t.Contexts.Store(ctx.httpCtx.ConnID(), &ctx)
 		httpCtx.SetBodyStreamWriter(func(writer *bufio.Writer) {
-			ctx.HttpWriter = writer
+			ctx.httpWriter = writer
 			ctx.pump(writer)
 		})
 	} else {
-		ctx := storyReadCtx{HttpCtx: httpCtx, Story: story, Logger: t.Logger}
-		ctx.writeError(err, "failed to create connection to Redis")
+		ctx := storyReadCtx{httpCtx: httpCtx, story: story, logger: t.Logger}
+		ctx.writeError(err, "Failed to create connection to Redis")
 	}
 }
 
@@ -176,27 +184,34 @@ func writeKeyValues(msg *strings.Builder, log *zerolog.Event, keyValues ...strin
 	}
 }
 
+// The following three methods are quite ugly. A single
+// common function writeEvent(id, event, data string) could be
+// extracted. Though I sacrifice the readability here
+// in order to avoid memory allocations. Otherwise we would
+// need to do some string concatenation when forming the
+// argument list for the writeEvent function, causing memory
+// allocation.
 func (ctx *storyReadCtx) writeShutdown() {
-	var log = ctx.Logger.Info().
-		Str("story", ctx.Story).
-		Uint64("connId", ctx.HttpCtx.ConnID())
+	var log = ctx.logger.Info().
+		Str("story", ctx.story).
+		Uint64("connId", ctx.httpCtx.ConnID())
 	var msg strings.Builder
-	msgId := uuid.Must(uuid.NewV4()).String()
+	msgId := ctx.uuidSupplier()
 	msg.WriteString("id: ")
 	msg.WriteString(msgId)
 	msg.WriteString("\nevent: shutdown\ndata: 0\n\n")
 	log.Msg("Server shutting down. Closing connection")
-	if ctx.HttpWriter != nil {
-		ctx.HttpWriter.WriteString(msg.String())
+	if ctx.httpWriter != nil {
+		ctx.httpWriter.WriteString(msg.String())
 	}
 }
 
 func (ctx *storyReadCtx) writeError(err error, description string, keyValues ...string) {
-	errId := uuid.Must(uuid.NewV4()).String()
-	var log = ctx.Logger.Error().
+	errId := ctx.uuidSupplier()
+	var log = ctx.logger.Error().
 		Err(err).
-		Str("story", ctx.Story).
-		Uint64("connId", ctx.HttpCtx.ConnID()).
+		Str("story", ctx.story).
+		Uint64("connId", ctx.httpCtx.ConnID()).
 		Str("errId", errId)
 	var msg strings.Builder
 	msg.WriteString("id: ")
@@ -211,10 +226,10 @@ func (ctx *storyReadCtx) writeError(err error, description string, keyValues ...
 	writeKeyValues(&msg, log, keyValues...)
 	msg.WriteString("}\n\n")
 	log.Msg(description)
-	if ctx.HttpWriter != nil {
-		ctx.HttpWriter.WriteString(msg.String())
+	if ctx.httpWriter != nil {
+		ctx.httpWriter.WriteString(msg.String())
 	} else {
-		ctx.HttpCtx.Error(msg.String(), 500)
+		ctx.httpCtx.Error(msg.String(), 500)
 	}
 }
 
@@ -233,25 +248,25 @@ func writeEntry(entry interface{}, writer *bufio.Writer, key string) {
 
 func (ctx *storyReadCtx) pump(writer *bufio.Writer) {
 	var entriesWritten uint64 = 0
-	key := ctx.KeyPrefix + "stories:" + ctx.Story
+	key := ctx.keyPrefix + "stories:" + ctx.story
 	firstId := "0"
 	for {
 		xReadArgs := []interface{}{
-			"COUNT", ctx.XReadCount, "BLOCK", 0, "STREAMS", key, firstId,
+			"COUNT", ctx.xReadCount, "BLOCK", 0, "STREAMS", key, firstId,
 		}
-		batch, err := ctx.RedisConn.Do("XREAD", xReadArgs...)
+		batch, err := ctx.redisConn.Do("XREAD", xReadArgs...)
 		if batch != nil && err == nil {
 			entries := toEntries(batch)
 			for _, entry := range entries {
 				writeEntry(entry, writer, key)
-				if ctx.EntriesToFlush != 0 {
+				if ctx.entriesToFlush != 0 {
 					entriesWritten++
-					if entriesWritten%ctx.EntriesToFlush == 0 {
-						ctx.Logger.Debug().
+					if entriesWritten%ctx.entriesToFlush == 0 {
+						ctx.logger.Debug().
 							Uint64("entriesWritten", entriesWritten).
-							Uint64("connId", ctx.HttpCtx.ConnID()).
-							Str("story", ctx.Story).
-							Uint64("entriesToFlush", ctx.EntriesToFlush).
+							Uint64("connId", ctx.httpCtx.ConnID()).
+							Str("story", ctx.story).
+							Uint64("entriesToFlush", ctx.entriesToFlush).
 							Msg("Flushing entries writer buffer")
 						// TODO how does EventSource treat trimmed event, when buffer is filled and flushed?
 						writer.Flush()
@@ -260,13 +275,13 @@ func (ctx *storyReadCtx) pump(writer *bufio.Writer) {
 			}
 			firstId = lastIdInBatch(entries)
 		} else if err != nil {
-			ctx.writeError(err, "failed to XREAD", "stream", key)
+			ctx.writeError(err, "Failed to XREAD", "stream", key)
 			writer.Flush()
-			ctx.HttpCtx.ResetBody()
-			ctx.Logger.Debug().
-				Uint64("connId", ctx.HttpCtx.ConnID()).
+			ctx.httpCtx.ResetBody()
+			ctx.logger.Debug().
+				Uint64("connId", ctx.httpCtx.ConnID()).
 				Msg("Unregistering HTTP connection")
-			ctx.Contexts.Delete(ctx.HttpCtx.ConnID())
+			ctx.contexts.Delete(ctx.httpCtx.ConnID())
 			return
 		} else {
 			break
