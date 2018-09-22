@@ -164,9 +164,9 @@ func (t *Tolstoyevsky) writeStoryHandler() func(ctx *fasthttp.RequestCtx) {
 			t.RedisWrite.Close()
 			redisWrite, err := t.redisConnection()
 			if err == nil {
+				t.RedisWrite = redisWrite
 				newId, err := redisWrite.Do("XADD", key, "*", "payload", payload)
 				if err == nil {
-					t.RedisWrite = redisWrite
 					writeNewId(ctx, key, newId)
 				} else {
 					t.writePutError(ctx, "Failed to XADD", err, key, payload)
