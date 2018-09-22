@@ -172,7 +172,7 @@ data: {"description":"Some description","cause":"some error","key1":"value1","ke
 `
 
 	// when
-	ctx.writeError(
+	ctx.writeGetError(
 		errors.New("some error"),
 		"Some description",
 		"key1", "value1", "key2", "value2",

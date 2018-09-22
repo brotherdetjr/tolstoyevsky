@@ -18,10 +18,13 @@ import (
 )
 
 type Tolstoyevsky struct {
-	Args       Args
-	Logger     *zerolog.Logger
-	Contexts   sync.Map
-	HttpServer *fasthttp.Server
+	Args          Args
+	Logger        *zerolog.Logger
+	Contexts      sync.Map
+	HttpServer    *fasthttp.Server
+	StoriesPrefix string
+	RedisWrite    redis.Conn
+	UuidSupplier  func() string
 }
 
 type Args struct {
@@ -50,8 +53,22 @@ func New(args Args, logger *zerolog.Logger) *Tolstoyevsky {
 
 	router := fasthttprouter.New()
 	httpServer := &fasthttp.Server{Handler: router.Handler}
-	var t = Tolstoyevsky{Args: args, Logger: logger, HttpServer: httpServer}
+	var t = Tolstoyevsky{
+		Args:          args,
+		Logger:        logger,
+		HttpServer:    httpServer,
+		StoriesPrefix: args.KeyPrefix + "stories:",
+		UuidSupplier:  UuidSupplier,
+	}
+	redisWrite, err := t.redisConnection()
+	if err != nil {
+		t.Logger.Panic().
+			Err(err).
+			Msg("Failed to create connection to Redis")
+	}
+	t.RedisWrite = redisWrite
 	router.GET("/stories/:story", t.readStoryHandler())
+	router.PUT("/stories/:story", t.writeStoryHandler())
 
 	go func() {
 		// reuseport allows linear scaling server performance on multi-CPU servers
@@ -82,9 +99,11 @@ func (t *Tolstoyevsky) AwaitShutdown() *Tolstoyevsky {
 }
 
 func (t *Tolstoyevsky) Close() error {
+	t.RedisWrite.Close()
 	t.Contexts.Range(func(key, value interface{}) bool {
 		ctx := value.(*storyReadCtx)
 		ctx.writeShutdown()
+		ctx.redisConn.Close()
 		if ctx.httpWriter != nil {
 			ctx.httpWriter.Flush()
 		}
@@ -127,6 +146,64 @@ func (t *Tolstoyevsky) redisConnection() (redis.Conn, error) {
 	return redis.Dial("tcp", t.Args.RedisAddr, redis.DialReadTimeout(t.Args.ReadTimeout))
 }
 
+func (t *Tolstoyevsky) writeStoryHandler() func(ctx *fasthttp.RequestCtx) {
+	return func(ctx *fasthttp.RequestCtx) {
+		story := ctx.UserValue("story").(string)
+		ctx.SetContentType("text/plain; charset=utf8")
+		ctx.Response.Header.Set("Cache-Control", "no-cache")
+		key := t.StoriesPrefix + story
+		payload := ctx.Request.Body()
+		newId, err := t.RedisWrite.Do("XADD", key, "*", "payload", payload)
+		if err == nil {
+			writeNewId(ctx, key, newId)
+		} else {
+			t.Logger.Warn().
+				Err(err).
+				Str("key", key).
+				Msg("Failed to XADD. Trying to reconnect and XADD one more time")
+			t.RedisWrite.Close()
+			redisWrite, err := t.redisConnection()
+			if err == nil {
+				newId, err := redisWrite.Do("XADD", key, "*", "payload", payload)
+				if err == nil {
+					t.RedisWrite = redisWrite
+					writeNewId(ctx, key, newId)
+				} else {
+					t.writePutError(ctx, "Failed to XADD", err, key, payload)
+				}
+			} else {
+				t.writePutError(ctx, "Failed to reconnect to Redis", err, key, payload)
+			}
+		}
+	}
+}
+
+func writeNewId(ctx *fasthttp.RequestCtx, key string, newId interface{}) {
+	ctx.SetStatusCode(200)
+	ctx.WriteString(key)
+	ctx.WriteString("-")
+	ctx.WriteString(newId.(string))
+	ctx.WriteString("\n")
+}
+
+func (t *Tolstoyevsky) writePutError(
+	ctx *fasthttp.RequestCtx, description string, err error, key string, payload []byte) {
+	id := t.UuidSupplier()
+	p := string(payload[:])
+	t.Logger.Error().Err(err).
+		Str("id", id).
+		Str("key", key).
+		Str("payload", p).
+		Msg(description)
+	ctx.SetStatusCode(500)
+	ctx.WriteString(id)
+	ctx.WriteString("\n")
+	ctx.WriteString(description)
+	ctx.WriteString("\n")
+	ctx.WriteString(err.Error())
+	ctx.WriteString("\n")
+}
+
 func (t *Tolstoyevsky) readStoryHandler() func(ctx *fasthttp.RequestCtx) {
 	return func(ctx *fasthttp.RequestCtx) {
 		story := ctx.UserValue("story").(string)
@@ -152,19 +229,24 @@ func (t *Tolstoyevsky) readStory(story string, httpCtx *fasthttp.RequestCtx) {
 			story:          story,
 			contexts:       &(t.Contexts),
 			logger:         t.Logger,
-			uuidSupplier:   UuidSupplier,
+			uuidSupplier:   t.UuidSupplier,
 		}
 		t.Logger.Debug().
 			Uint64("connId", ctx.httpCtx.ConnID()).
-			Msg("Registering new HTTP connection")
+			Msg("Registering new HTTP connection for story reading")
 		t.Contexts.Store(ctx.httpCtx.ConnID(), &ctx)
 		httpCtx.SetBodyStreamWriter(func(writer *bufio.Writer) {
 			ctx.httpWriter = writer
 			ctx.pump(writer)
 		})
 	} else {
-		ctx := storyReadCtx{httpCtx: httpCtx, story: story, logger: t.Logger, uuidSupplier: UuidSupplier}
-		ctx.writeError(err, "Failed to create connection to Redis")
+		ctx := storyReadCtx{
+			httpCtx:      httpCtx,
+			story:        story,
+			logger:       t.Logger,
+			uuidSupplier: t.UuidSupplier,
+		}
+		ctx.writeGetError(err, "Failed to create connection to Redis")
 	}
 }
 
@@ -214,7 +296,7 @@ func (ctx *storyReadCtx) writeShutdown() {
 	}
 }
 
-func (ctx *storyReadCtx) writeError(err error, description string, keyValues ...string) {
+func (ctx *storyReadCtx) writeGetError(err error, description string, keyValues ...string) {
 	errId := ctx.uuidSupplier()
 	var log = ctx.logger.Error().
 		Err(err).
@@ -283,7 +365,7 @@ func (ctx *storyReadCtx) pump(writer *bufio.Writer) {
 			}
 			firstId = lastIdInBatch(entries)
 		} else if err != nil {
-			ctx.writeError(err, "Failed to XREAD", "stream", key)
+			ctx.writeGetError(err, "Failed to XREAD", "stream", key)
 			writer.Flush()
 			ctx.httpCtx.ResetBody()
 			ctx.logger.Debug().
