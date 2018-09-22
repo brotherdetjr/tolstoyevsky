@@ -7,6 +7,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/satori/go.uuid"
 	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/reuseport"
 	"os"
 	"os/signal"
 	"strconv"
@@ -53,10 +54,17 @@ func New(args Args, logger *zerolog.Logger) *Tolstoyevsky {
 	router.GET("/stories/:story", t.readStoryHandler())
 
 	go func() {
-		if err := httpServer.ListenAndServe(t.Args.ListenAddr); err != nil {
+		// reuseport allows linear scaling server performance on multi-CPU servers
+		ln, err := reuseport.Listen("tcp4", t.Args.ListenAddr)
+		if err != nil {
 			t.Logger.Panic().
 				Err(err).
-				Msg("Error in ListenAndServe")
+				Msg("Error in reuseport.Listen")
+		}
+		if err = httpServer.Serve(ln); err != nil {
+			t.Logger.Panic().
+				Err(err).
+				Msg("Error in httpServer.Serve")
 		}
 	}()
 
@@ -155,7 +163,7 @@ func (t *Tolstoyevsky) readStory(story string, httpCtx *fasthttp.RequestCtx) {
 			ctx.pump(writer)
 		})
 	} else {
-		ctx := storyReadCtx{httpCtx: httpCtx, story: story, logger: t.Logger}
+		ctx := storyReadCtx{httpCtx: httpCtx, story: story, logger: t.Logger, uuidSupplier: UuidSupplier}
 		ctx.writeError(err, "Failed to create connection to Redis")
 	}
 }
