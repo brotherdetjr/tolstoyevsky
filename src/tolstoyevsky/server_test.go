@@ -228,8 +228,11 @@ id: p:stories:story1-89012-2
 event: entry
 data: {"value": 129}
 
+id: p:stories:story1-89012-3
+event: entry
+data: {"value": 130}
+
 `
-	// the last entry is not flushed
 
 	// interactions
 	conn.Command("XREAD", "COUNT", uint(2), "BLOCK", 0, "STREAMS", "p:stories:story1", "0").

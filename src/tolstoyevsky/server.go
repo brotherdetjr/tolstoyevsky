@@ -102,12 +102,9 @@ func (t *Tolstoyevsky) Close() error {
 	t.RedisWrite.Close()
 	t.Contexts.Range(func(key, value interface{}) bool {
 		ctx := value.(*storyReadCtx)
+		ctx.isClosing = true
 		ctx.writeShutdown()
 		ctx.redisConn.Close()
-		if ctx.httpWriter != nil {
-			ctx.httpWriter.Flush()
-		}
-		ctx.httpCtx.ResetBody()
 		return true
 	})
 	return t.HttpServer.Shutdown()
@@ -140,6 +137,7 @@ type storyReadCtx struct {
 	contexts       *sync.Map
 	logger         *zerolog.Logger
 	uuidSupplier   func() string
+	isClosing      bool
 }
 
 func (t *Tolstoyevsky) redisConnection() (redis.Conn, error) {
@@ -290,7 +288,7 @@ func (ctx *storyReadCtx) writeShutdown() {
 	msg.WriteString("id: ")
 	msg.WriteString(msgId)
 	msg.WriteString("\nevent: shutdown\ndata: 0\n\n")
-	log.Msg("Server shutting down. Closing connection")
+	log.Msg("Closing connection")
 	if ctx.httpWriter != nil {
 		ctx.httpWriter.WriteString(msg.String())
 	}
@@ -364,7 +362,7 @@ func (ctx *storyReadCtx) pump(writer *bufio.Writer) {
 				}
 			}
 			firstId = lastIdInBatch(entries)
-		} else if err != nil {
+		} else if err != nil && !ctx.isClosing {
 			ctx.writeGetError(err, "Failed to XREAD", "stream", key)
 			writer.Flush()
 			ctx.httpCtx.ResetBody()
@@ -374,6 +372,8 @@ func (ctx *storyReadCtx) pump(writer *bufio.Writer) {
 			ctx.contexts.Delete(ctx.httpCtx.ConnID())
 			return
 		} else {
+			writer.Flush()
+			ctx.httpCtx.ResetBody()
 			break
 		}
 	}
